@@ -323,10 +323,10 @@ function openTx(client: pg.PoolClient): Tx {
       const row = await one<RunRow>(`SELECT ${RUN_COLUMNS} FROM runs WHERE id = $1`, [runId]);
       return row && toRun(row);
     },
-    async findRunByTrigger(automationId, commentId) {
+    async findRunByComment(accountId, commentId) {
       const row = await one<RunRow>(
-        `SELECT ${RUN_COLUMNS} FROM runs WHERE automation_id = $1 AND trigger_comment_id = $2`,
-        [automationId, commentId],
+        `SELECT ${RUN_COLUMNS} FROM runs WHERE account_id = $1 AND trigger_comment_id = $2`,
+        [accountId, commentId],
       );
       return row && toRun(row);
     },

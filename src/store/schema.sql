@@ -40,8 +40,9 @@ CREATE TABLE runs (
   created_at         bigint NOT NULL,
   started_at         bigint,
   updated_at         bigint NOT NULL,
-  -- insertRun / updateRun invariant; also serves findRunByTrigger.
-  CONSTRAINT runs_trigger_unique UNIQUE (automation_id, trigger_comment_id)
+  -- insertRun / updateRun invariant: a comment starts at most one run, because the
+  -- platform gives a comment one private reply. Also serves findRunByComment.
+  CONSTRAINT runs_trigger_unique UNIQUE (account_id, trigger_comment_id)
 );
 -- insertRun / updateRun invariant: one owner per conversation (ACTIVE_STATUSES); also serves findActiveRun.
 CREATE UNIQUE INDEX runs_one_active_per_conversation ON runs (account_id, contact_id)

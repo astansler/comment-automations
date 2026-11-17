@@ -19,6 +19,7 @@ import {
 import type { Store, StoredEffect } from '../src/store/store.js';
 import type { MakeStore } from './store.contract.js';
 import { createClock, createFakePlatform, createIds, fault } from './support/fakePlatform.js';
+import { CrashError, createFaultyStore } from './support/faultyStore.js';
 
 const loaded = validateDefinition(JSON.parse(readFileSync(new URL('../examples/pricing.json', import.meta.url), 'utf8')));
 if (!loaded.ok) throw new Error(`examples/pricing.json is invalid: ${loaded.errors.join('; ')}`);
@@ -385,6 +386,38 @@ export function runtimeScenarios(name: string, makeStore: MakeStore): void {
       expect(h.platform.deliveries.filter((d) => d.text === TEXT.prompt || d.text === TEXT.demoPrompt)).toHaveLength(1);
     });
 
+    // Found by test/simulation.test.ts (I3/I10). One comment has one private reply.
+    // When a comment matched two automations, both runs used it: the second run's
+    // first DM got `already_sent`, was recorded as sent, and never reached the contact.
+    it('starts only one automation per comment, so a second run never mistakes the first run\'s private reply for its own', async () => {
+      const h = setup();
+      await h.publish();
+      await h.publish({ id: 'demo-v1', automationId: 'demo', definition: DEMO });
+
+      expect(await h.comment('pricing and a demo')).toEqual({
+        status: 'matched',
+        triggers: [
+          { automationId: 'demo', status: 'created', runId: 'run-0001' },
+          { automationId: 'pricing', status: 'comment_taken' },
+        ],
+      });
+      // A new event for the same comment starts nothing new either.
+      expect(await h.comment('pricing and a demo', { commentId: 'comment-1' })).toEqual({
+        status: 'matched',
+        triggers: [
+          { automationId: 'demo', status: 'already_triggered', runId: 'run-0001' },
+          { automationId: 'pricing', status: 'comment_taken' },
+        ],
+      });
+      await h.runUntilIdle();
+      await h.message('alice@example.com');
+      await h.runUntilIdle();
+
+      expect(await h.run('run-0001')).toMatchObject({ status: 'completed' });
+      expect(await store.tx((tx) => tx.getRun('run-0002'))).toBeNull();
+      expect(h.sent()).toEqual([`private_reply: ${TEXT.demoPrompt}`, `direct_message: ${TEXT.demoLink}`]);
+    });
+
     it('skips a re-trigger by the same contact inside the cooldown window, and accepts one after it', async () => {
       const h = setup();
       await h.publish({ cooldownSeconds: 3600 });
@@ -607,6 +640,80 @@ export function runtimeScenarios(name: string, makeStore: MakeStore): void {
       expect(h.platform.reconcileCalls).toEqual(['run-0001:0:0']);
       expect(await h.effect('run-0001:0:0')).toMatchObject({ status: 'sent', attempts: 2 });
       expect(h.sent()).toEqual([`reply_to_comment: ${TEXT.reply}`, `private_reply: ${TEXT.prompt}`]);
+    });
+
+    // Found by test/simulation.test.ts (I4). The lease covers a whole claimed batch,
+    // but the batch is sent one effect at a time. If the first send outlasts the
+    // lease, a second worker reclaims the rest of the batch and sends it; the first
+    // worker then reached the same effects and sent them again, with no
+    // reconcile, because to it they were fresh claims.
+    it('does not send a batched effect whose lease lapsed before its turn, even after another worker sent it', async () => {
+      const h = setup({ batchSize: 2 });
+      const other = createRuntime({ store, adapter: h.platform, now: h.clock.now, newId: createIds('other'), config: { batchSize: 2 } });
+      await h.publish();
+      await h.comment('pricing', { from: 'alice' });
+      await h.comment('pricing', { from: 'bob' });
+
+      let slowed = false;
+      h.platform.onDelivered(async () => {
+        if (slowed) return;
+        slowed = true;
+        // The first send of the batch is slow: the lease lapses and another worker runs.
+        h.clock.advance(LEASE_MS + 1);
+        await other.tick();
+      });
+      await h.tick();
+      await h.runUntilIdle();
+
+      const replies = h.platform.deliveries.filter((d) => d.kind === 'reply_to_comment').map((d) => d.key);
+      expect(replies.sort()).toEqual(['run-0001:0:0', 'run-0002:0:0']);
+    });
+
+    it("does not take back another worker's claim: a lapsed batch member reclaimed by a worker that died after sending stays in doubt", async () => {
+      const crashing = createFaultyStore(store);
+      const h = setup({ batchSize: 2 });
+      const other = createRuntime({ store: crashing, adapter: h.platform, now: h.clock.now, newId: createIds('other'), config: { batchSize: 2 } });
+      await h.publish();
+      await h.comment('pricing', { from: 'alice' });
+      await h.comment('pricing', { from: 'bob' });
+
+      let slowed = false;
+      h.platform.onDelivered(async () => {
+        if (slowed) return;
+        slowed = true;
+        h.clock.advance(LEASE_MS + 1);
+        // The other worker reclaims both, reconciles alice's reply as sent, sends bob's,
+        // and dies before recording it (its 5th transaction: claim, read, settle, read, settle).
+        crashing.arm('before', 4);
+        await expect(other.tick()).rejects.toBeInstanceOf(CrashError);
+      });
+      await h.tick();
+      // Bob's reply is the dead worker's claim, in doubt: it must not go back to pending.
+      expect(await h.effect('run-0002:0:0')).toMatchObject({ status: 'sending', attempts: 2 });
+
+      h.clock.advance(LEASE_MS);
+      await h.runUntilIdle();
+      expect(h.platform.deliveries.filter((d) => d.key === 'run-0002:0:0')).toHaveLength(1);
+      expect(await h.effect('run-0002:0:0')).toMatchObject({ status: 'sent' });
+    });
+
+    it('puts a batched effect whose lease lapsed before its turn back to pending, unsent and not in doubt', async () => {
+      const h = setup({ batchSize: 2 });
+      await h.publish();
+      await h.comment('pricing', { from: 'alice' });
+      await h.comment('pricing', { from: 'bob' });
+      let slowed = false;
+      h.platform.onDelivered(async () => {
+        if (!slowed) h.clock.advance(LEASE_MS + 1);
+        slowed = true;
+      });
+
+      expect((await h.tick()).effects).toMatchObject({ sent: 1, deferred: 1 });
+      expect(await h.effect('run-0002:0:0')).toMatchObject({ status: 'pending', attempts: 0 });
+      h.platform.reconcileAnswers('unknown'); // would wrongly mark it sent if it were treated as in flight
+      await h.runUntilIdle();
+      expect(h.platform.reconcileCalls).toEqual([]);
+      expect(h.platform.deliveries.filter((d) => d.key === 'run-0002:0:0')).toHaveLength(1);
     });
 
     it('cancelling a run drops its pending effect undelivered and promotes the next queued run', async () => {

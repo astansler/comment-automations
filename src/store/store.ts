@@ -84,7 +84,8 @@ export interface Tx {
    */
   lockConversation(accountId: string, contactId: string): Promise<void>;
   getRun(runId: string): Promise<Run | null>;
-  findRunByTrigger(automationId: string, commentId: string): Promise<Run | null>;
+  /** The run this comment started, if any. A comment starts at most one run. */
+  findRunByComment(accountId: string, commentId: string): Promise<Run | null>;
   /** The run that owns the conversation: status in ACTIVE_STATUSES. */
   findActiveRun(accountId: string, contactId: string): Promise<Run | null>;
   /** Oldest `queued` run for the conversation, by createdAt then id. */
@@ -93,7 +94,7 @@ export interface Tx {
   hasRunSince(automationId: string, contactId: string, since: Millis): Promise<boolean>;
   /**
    * Throws if it would violate either invariant:
-   * unique (automationId, triggerCommentId), or one active run per conversation.
+   * unique (accountId, triggerCommentId), or one active run per conversation.
    */
   insertRun(run: Run): Promise<void>;
   /** Full replace by id. Throws if it would create a second active run for the conversation. */

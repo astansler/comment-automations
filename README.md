@@ -11,11 +11,12 @@ A design for automations that start when someone comments on a social post, with
 | This file | The design: architecture, data model, execution model, reliability, concurrency |
 | [`docs/failure-modes.md`](docs/failure-modes.md) | Every failure and race I could think of, what the system does, and the test that proves it |
 | [`docs/capacity.md`](docs/capacity.md) | Load estimates by stage, spikes, and what changes when |
-| [`src/`](src) | About 1,500 lines of TypeScript: the pure engine, the Postgres schema and store, the runtime |
-| [`test/`](test) | Unit, property, scenario, simulation and real-Postgres concurrency tests |
+| [`docs/testing.md`](docs/testing.md) | The invariants checked, the two bugs the simulation found, and the mutation results |
+| [`src/`](src) | About 2,200 lines of TypeScript and SQL: the pure engine, the Postgres schema and store, the runtime |
+| [`test/`](test) | 228 tests: unit, property, scenario, randomized simulation, and real-Postgres concurrency |
 | [`AI-USAGE.md`](AI-USAGE.md) | What I did myself and where I used AI |
 
-The brief asks for a design, not code. I wrote code anyway for one reason: claims like "a reply racing a timeout is safe" are cheap to write and easy to get wrong, so the claims in this document that can be tested are tested. The HTTP layer, the Instagram client and the UI are assumed to exist, as the brief allows.
+The brief asks for a design, not code. I wrote code anyway for one reason: claims like "a reply racing a timeout is safe" are cheap to write and easy to get wrong, so the claims in this document that can be tested are tested. It paid for itself: the randomized simulation found two real bugs in code that already passed 216 tests, one of them a design error and not a typo (section 8). The HTTP layer, the Instagram client and the UI are assumed to exist, as the brief allows.
 
 ```bash
 npm install
@@ -110,7 +111,7 @@ Full DDL with a comment on every index: [`src/store/schema.sql`](src/store/schem
 |---|---|---|
 | `automation_versions` | Immutable published definitions | |
 | `inbound_events` | Webhook event IDs already processed | Primary key: a redelivery inserts nothing |
-| `runs` | One execution for one commenter: status, step index, captured fields, deadline | Unique `(automation, trigger comment)`: a comment starts an automation once. Partial unique `(account, contact)` where status is active: **one owner per conversation** |
+| `runs` | One execution for one commenter: status, step index, captured fields, deadline | Unique `(account, trigger comment)`: **a comment starts at most one run**, because it has one private reply to give. Partial unique `(account, contact)` where status is active: **one owner per conversation** |
 | `messages` | Every inbound DM, with which run consumed it (or none) | Primary key on the platform message ID |
 | `effects` | The outbox and the permanent ledger of every send | Primary key is the idempotency key `run:step:attempt` |
 | `account_throttles` | "Do not send for this account before T" | |
@@ -154,7 +155,7 @@ stateDiagram-v2
 | Message | Policy | Behaviour | Reason |
 |---|---|---|---|
 | Private reply (first DM) | `retry_safe` | Retry. "Already replied to this comment" counts as success. | The platform allows exactly one per comment, so it deduplicates for us. |
-| Public comment reply | `at_most_once` | Never blindly retried. Reconcile against the platform; if still unknown, assume sent. | Two identical public replies look broken to everyone reading the post. A missing "Sent you a DM!" costs nothing. |
+| Public comment reply | `at_most_once` | Never blindly retried. Reconcile against the platform; if still unknown, assume sent. Holds as long as a platform call finishes inside its lease (60 s), so the adapter's request timeout must be shorter than that. | Two identical public replies look broken to everyone reading the post. A missing "Sent you a DM!" costs nothing. |
 | Later DMs (the link) | `at_least_once` | Retry with backoff. | A duplicate link is a small annoyance. A lead who gave their email and got nothing is a lost customer. |
 
 The system is therefore honest about being at-least-once for the link, and there is a test that asserts the duplicate rather than pretending it cannot happen. Removing it for real needs either an idempotency key from the platform or reconciliation via message echo webhooks, which I would add next.
@@ -168,18 +169,32 @@ The complete list, with the test for each row, is in [`docs/failure-modes.md`](d
 - **Webhooks arrive more than once, late, or not at all.** Event IDs and message IDs are primary keys. Missed message webhooks are a known Instagram problem, so production needs a slow reconciliation poll of the conversations API per account with waiting runs (designed, not built).
 - **A worker dies mid-send.** The outbox row stays `sending` with a lease. When the lease expires another worker claims it, sees that a previous attempt may have reached the platform, and applies the policy above.
 - **Two workers, one message.** `SKIP LOCKED` hands each due row to one claimer. Settling re-checks the row under the conversation lock, and the engine ignores a result whose key is not the one the run is waiting on, so even a double settle changes nothing.
+- **A worker holds a claim too long.** A batch is claimed under one lease and sent one message at a time. Before each send the worker checks its lease is still valid, and gives the message back if not. Every write back to the outbox is fenced on the attempt counter, so a slow worker cannot overwrite a newer claim.
 - **Rate limits.** A rate-limit response throttles the whole account until the platform's retry-after, does not count against the message's attempts, and does not affect other accounts.
 - **Permanent failures** (blocked DMs, deleted comment, revoked token) end the run with the platform's code in the log, and free the conversation for the next queued run.
 - **Our own reply re-triggering the automation.** "Sent you a DM!" comes back as a comment webhook. Comments authored by the account never match.
 - **The same person commenting five times.** One run per comment, plus a per-automation cooldown per contact.
+- **One comment matching two automations** ("pricing and a demo please"). Only one starts; the other is reported as `comment_taken`.
 
 **How the concurrency claims are tested.** Three layers:
 
 1. *Property tests on the engine*: for random valid definitions and random event sequences (stale keys, reordered timers, repeated starts), the engine never throws, never mutates, never repeats an effect key, never moves backwards, and terminal states absorb everything.
-2. *Simulation of the whole runtime*: random interleavings of comments, replies, redeliveries, platform faults, worker crashes and clock jumps against a fake platform that enforces Instagram's rules. Invariants are checked after every step.
-3. *Real Postgres, real connections*: concurrent workers and concurrent webhooks against the actual schema, checking that no message is claimed twice and no conversation gets two owners.
+2. *Simulation of the whole runtime*: 1,000 random sequences per run of comments, replies, redeliveries, platform faults, clock jumps, cancellations, overlapping calls, and crashes injected before and after commit, against a fake platform that enforces Instagram's rules. Fifteen invariants are checked after every action, and at the end of every sequence the system must drain to a state where every run has ended. Fully deterministic, so a failure replays from its seed.
+3. *Real Postgres, real connections*: 200 concurrent webhooks with duplicates and four concurrent workers; thirty comments from one person at once; replies racing timers. Every message delivered exactly once, runs of one conversation never interleave, and each run ends either completed or expired, never both.
 
-## 8. Platform constraints that shaped the design
+## 8. What the tests found
+
+Two bugs, both in code that passed every hand-written scenario. Details and the mutation table are in [`docs/testing.md`](docs/testing.md).
+
+**One comment, two automations.** A comment matching two automations started two runs. The first used the comment's private reply. When the second run's turn came, its first DM was also a private reply to the same comment; the platform answered "already sent", and the `retry_safe` policy read that as success. The run carried on, waiting for an answer to a question the person never received. The cause was a design error, not a slip: uniqueness had been defined per (automation, comment), but the platform's budget is per comment. The fix is the rule "a comment starts at most one run", now a unique index and not only application logic.
+
+This is also the limit of `retry_safe`: "already sent" means success only if nothing else can spend that comment's private reply. A person on the customer's team replying privately by hand still can.
+
+**A lease that covers a batch.** A worker claims twenty messages under one sixty-second lease and sends them in turn. If an early send is slow, the lease expires, a second worker reclaims the rest, reconciles and sends them. The first worker then reaches the same messages and, believing its claim is fresh, sends them again without reconciling: a second public reply, which is exactly what `at_most_once` promises will not happen. The fix is a lease check before every send.
+
+To check that the tests can fail, twenty-one bugs were introduced into the source one at a time. The simulation caught nineteen, one of them only in about four runs out of ten, so that one also has a deterministic test. The remaining two are caught by the engine's own tests; the testing doc explains why the simulation cannot see them.
+
+## 9. Platform constraints that shaped the design
 
 Checked against Meta's documentation in November 2026; links in [`docs/capacity.md`](docs/capacity.md).
 
@@ -187,7 +202,7 @@ Checked against Meta's documentation in November 2026; links in [`docs/capacity.
 - **Ordinary DMs only inside 24 hours of the person's last message.** The example's `timeoutSeconds` is 23 hours for this reason: if they have not answered by then, we could not follow up anyway. One consequence worth saying out loud: the system cannot send a reminder to someone who never replied. Sources disagree on whether the private reply itself opens the 24-hour window; I designed to Meta's wording, which says the person must respond first.
 - **750 private replies per hour per account.** This, not our infrastructure, is the ceiling during a viral post. See capacity.
 
-## 9. Built, and not built
+## 10. Built, and not built
 
 | Built and tested | Designed here, not built |
 |---|---|
@@ -196,14 +211,16 @@ Checked against Meta's documentation in November 2026; links in [`docs/capacity.
 | Postgres schema and store, in-memory store, one contract suite for both | Proactive per-account token bucket (today: reactive throttle on rate-limit errors) |
 | Runtime: ingest, outbox worker, timers, crash recovery, queueing, cancel | Reconciliation poll for missed webhooks |
 | Fake platform that enforces the private-reply and messaging-window rules | Backlog ordering and shedding policy for spikes |
+| Randomized simulation with crash injection; Postgres concurrency tests | A request timeout below the lease in the adapter |
 | | Retention and partitioning of `run_log`, `messages`, `inbound_events` |
 | | Token refresh, account pause and customer notification on revoked access |
 
-## 10. Open product questions
+## 11. Open product questions
 
 These are decisions I would want to make with whoever owns the product, not alone:
 
 1. **Order of the first two steps.** The brief replies "Sent you a DM!" before sending the DM. If the DM then fails (the person blocks DMs from businesses), the public reply is untrue. The engine runs steps in whatever order the definition gives; I would default new automations to DM first.
 2. **Spike ordering.** With a backlog of matched comments and 750 sends an hour, newest-first probably converts better and oldest-first loses fewer to the 7-day limit.
 3. **A human in the thread.** If someone on the customer's team replies manually while a run is waiting, the run should probably stand down. That needs the echo webhook and a policy.
-4. **Non-answers.** "What is this for?" is not an email. Today that is a reprompt and eventually `no_valid_reply`. It is also exactly the moment a person or an LLM should take over.
+4. **One comment, several automations.** Today the first match by automation ID wins and the rest are skipped. The customer should probably choose a priority, or be warned at publish time that two automations overlap.
+5. **Non-answers.** "What is this for?" is not an email. Today that is a reprompt and eventually `no_valid_reply`. It is also exactly the moment a person or an LLM should take over.

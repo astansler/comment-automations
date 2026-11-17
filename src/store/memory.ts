@@ -18,6 +18,9 @@ export interface MemorySnapshot {
   runs: Run[];
   effects: StoredEffect[];
   messages: StoredMessage[];
+  leads: { accountId: string; contactId: string; field: string; value: string }[];
+  runLog: RunLogEntry[];
+  throttles: { accountId: string; until: Millis }[];
 }
 
 const copy = <T>(value: T): T => structuredClone(value);
@@ -42,7 +45,7 @@ function emptyState(): State {
 function checkRunInvariants(s: State, run: Run): void {
   for (const other of s.runs.values()) {
     if (other.id === run.id) continue;
-    if (other.automationId === run.automationId && other.triggerCommentId === run.triggerCommentId) {
+    if (other.accountId === run.accountId && other.triggerCommentId === run.triggerCommentId) {
       throw new StoreConflictError('duplicate_trigger');
     }
     if (
@@ -87,9 +90,9 @@ function openTx(s: State): Tx {
       const r = s.runs.get(runId);
       return r ? copy(r) : null;
     },
-    async findRunByTrigger(automationId, commentId) {
+    async findRunByComment(accountId, commentId) {
       for (const r of s.runs.values()) {
-        if (r.automationId === automationId && r.triggerCommentId === commentId) return copy(r);
+        if (r.accountId === accountId && r.triggerCommentId === commentId) return copy(r);
       }
       return null;
     },
@@ -230,6 +233,12 @@ export function createMemoryStore(): Store & { snapshot(): MemorySnapshot } {
         runs: [...state.runs.values()],
         effects: [...state.effects.values()],
         messages: [...state.messages.values()],
+        leads: [...state.leads].flatMap(([key, fields]) => {
+          const [accountId, contactId] = JSON.parse(key) as [string, string];
+          return Object.entries(fields).map(([field, value]) => ({ accountId, contactId, field, value }));
+        }),
+        runLog: state.runLog,
+        throttles: [...state.throttles].map(([accountId, until]) => ({ accountId, until })),
       });
     },
   };

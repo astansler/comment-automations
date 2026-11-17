@@ -267,12 +267,12 @@ export function storeContract(name: string, makeStore: MakeStore): void {
         expect(await store.tx((tx) => tx.getRun('run-1'))).toEqual(aRun({ context: { a: '1' } }));
       });
 
-      it('findRunByTrigger matches automation and comment', async () => {
+      it('findRunByComment matches account and comment', async () => {
         await store.tx((tx) => tx.insertRun(aRun()));
         await store.tx(async (tx) => {
-          expect(await tx.findRunByTrigger('auto-1', 'comment-1')).toEqual(aRun());
-          expect(await tx.findRunByTrigger('auto-2', 'comment-1')).toBeNull();
-          expect(await tx.findRunByTrigger('auto-1', 'comment-2')).toBeNull();
+          expect(await tx.findRunByComment('acct-1', 'comment-1')).toEqual(aRun());
+          expect(await tx.findRunByComment('acct-2', 'comment-1')).toBeNull();
+          expect(await tx.findRunByComment('acct-1', 'comment-2')).toBeNull();
         });
       });
 
@@ -321,8 +321,13 @@ export function storeContract(name: string, makeStore: MakeStore): void {
       it('insertRun rejects a second run for the same trigger comment with duplicate_trigger', async () => {
         await store.tx((tx) => tx.insertRun(aRun()));
         await expectConflict(store.tx((tx) => tx.insertRun(aRun({ id: 'run-2', contactId: 'contact-2' }))), 'duplicate_trigger');
-        // The same comment may trigger a different automation.
-        await store.tx((tx) => tx.insertRun(aRun({ id: 'run-3', automationId: 'auto-2' })));
+        // Also for a different automation: a comment has one private reply to give.
+        await expectConflict(
+          store.tx((tx) => tx.insertRun(aRun({ id: 'run-3', automationId: 'auto-2', status: 'queued' }))),
+          'duplicate_trigger',
+        );
+        // Comment ids are only unique within an account.
+        await store.tx((tx) => tx.insertRun(aRun({ id: 'run-4', accountId: 'acct-2' })));
       });
 
       it('insertRun rejects a second active run in the conversation with conversation_busy', async () => {

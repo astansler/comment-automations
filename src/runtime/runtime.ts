@@ -50,7 +50,9 @@ export type PublishResult = { status: 'published' } | { status: 'invalid'; error
 export type TriggerResult =
   | { automationId: string; status: 'created'; runId: string }
   | { automationId: string; status: 'already_triggered'; runId: string }
-  | { automationId: string; status: 'cooldown' };
+  | { automationId: string; status: 'cooldown' }
+  /** The comment already started another automation; a comment has only one private reply to give. */
+  | { automationId: string; status: 'comment_taken' };
 
 export type CommentResult =
   | { status: 'duplicate' }
@@ -75,7 +77,7 @@ export type EffectOutcome =
   | 'failed'
   /** Back to `pending` for a later attempt. */
   | 'retrying'
-  /** Not attempted: an earlier effect in the same tick hit this account's rate limit. */
+  /** Not attempted, back to `pending`: an earlier effect in the same tick hit this account's rate limit, or the claim's lease lapsed before its turn. */
   | 'deferred'
   /** Left `sending` after an unknown outcome; reconciled once its lease lapses. */
   | 'in_doubt'
@@ -315,6 +317,23 @@ export function createRuntime(deps: {
       return settle(effect, { status: 'failed', code: 'retries_exhausted' });
     }
 
+    // The lease covers the whole claimed batch, which is sent one effect at a
+    // time. Once it has lapsed, another worker may already have reclaimed this
+    // row (and sent it): it is no longer ours to send. We know we never sent
+    // it, so if nobody has reclaimed it yet it goes back to `pending` (fenced
+    // on attempts) rather than being reconciled later as in flight. A send that
+    // starts before the lapse and outlasts it is the in-flight case the
+    // policies exist for.
+    if (now() >= (effect.leaseUntil ?? -Infinity)) {
+      const outcome = await reschedule(effect, {
+        delayMs: null,
+        lastError: effect.lastError,
+        countAttempt: false,
+        throttleMs: null,
+      });
+      return outcome === 'retrying' ? 'deferred' : outcome;
+    }
+
     let result: SendResult;
     try {
       result = await adapter.send(effect);
@@ -378,12 +397,21 @@ export function createRuntime(deps: {
         await tx.lockConversation(comment.accountId, contactId);
         const at = now();
         const triggers: TriggerResult[] = [];
+        // One comment starts at most one run. The platform allows one private
+        // reply per comment, so two runs on the same comment would share it: the
+        // second run's first DM would come back `already_sent`, be read as
+        // delivered, and never reach the contact. First match by automation id wins.
+        // Read first: a unique violation would kill a Postgres transaction.
+        const prior = await tx.findRunByComment(comment.accountId, comment.commentId);
+        let taken = prior !== null;
         for (const version of versions) {
           const { automationId } = version;
-          // Read first: a unique violation would kill a Postgres transaction.
-          const existing = await tx.findRunByTrigger(automationId, comment.commentId);
-          if (existing !== null) {
-            triggers.push({ automationId, status: 'already_triggered', runId: existing.id });
+          if (prior?.automationId === automationId) {
+            triggers.push({ automationId, status: 'already_triggered', runId: prior.id });
+            continue;
+          }
+          if (taken) {
+            triggers.push({ automationId, status: 'comment_taken' });
             continue;
           }
           const since = at - version.cooldownSeconds * 1000;
@@ -395,6 +423,7 @@ export function createRuntime(deps: {
           await tx.insertRun(run);
           await tx.appendRunLog(run.id, at, `triggered by comment ${comment.commentId}`);
           triggers.push({ automationId, status: 'created', runId: run.id });
+          taken = true;
         }
         await promote(tx, at, comment.accountId, contactId);
         return { status: 'matched', triggers };
