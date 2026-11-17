@@ -29,7 +29,9 @@ DATABASE_URL=postgres://postgres@localhost:54329/automations_test npm test
 
 Running four steps in order is not the hard part. Two facts about the platform are, and the design is organised around them.
 
-**An inbound DM carries no correlation ID.** The webhook says "account A received text T from user U". Nothing ties it to the automation that asked the question. So the link between a reply and a waiting run has to be inferred, and the inference breaks whenever two runs could plausibly own the same reply, when the reply arrives before we have recorded that we are waiting, or after we gave up.
+**A typed reply carries no correlation ID.** For an ordinary text message the webhook says "account A received text T from user U", with a message ID and nothing else. Nothing ties it to the automation that asked the question. So the link between a reply and a waiting run has to be inferred, and the inference breaks whenever two runs could plausibly own the same reply, when the reply arrives before we have recorded that we are waiting, or after we gave up.
+
+The platform does give a link in two narrower cases: a swipe-to-reply carries the ID of the message it answers (`reply_to.mid`), and a tapped quick reply or button returns a payload we chose. An email address is typed, so the example cannot rely on either. The reference code does not read these signals; when present they should override the inference, and that is an extension to `ingestMessage`, not a change to the model.
 
 **Sending is not idempotent.** The send endpoint takes no idempotency key. A call that times out, or a worker that dies between the call and the commit, leaves us not knowing whether the commenter got the message. Retrying may send twice. Not retrying may send nothing. No amount of careful queueing removes that choice; it can only be made deliberately, per kind of message.
 
