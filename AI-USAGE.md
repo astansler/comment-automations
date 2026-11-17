@@ -21,7 +21,7 @@ Fill in truthfully. Candidates, only if they are true by the time this is sent:
   connection works, for everything to be tested, for a reference implementation.
 - Read every file in src/ and can explain each decision without notes.
 - Decisions I made or changed after reviewing the draft (list them, with why).
-- Positions on the open product questions in README section 11.
+- Positions on the open product questions in README section 13.
 - Anything I disagreed with and changed.
 -->
 
