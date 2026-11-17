@@ -1,0 +1,23 @@
+{
+  "trigger": {
+    "type": "comment_keyword",
+    "platform": "instagram",
+    "keywords": ["pricing"],
+    "match": "contains",
+    "postIds": "any"
+  },
+  "steps": [
+    { "type": "reply_to_comment", "text": "Sent you a DM!" },
+    {
+      "type": "ask",
+      "prompt": "Happy to share pricing. What's the best email to send it to?",
+      "capture": "email",
+      "saveAs": "email",
+      "timeoutSeconds": 82800,
+      "maxAttempts": 3,
+      "repromptText": "I couldn't spot an email address in that. Could you send it again?",
+      "skipIfKnown": true
+    },
+    { "type": "send_dm", "text": "Thanks! Here is the link: https://example.com/pricing" }
+  ]
+}
