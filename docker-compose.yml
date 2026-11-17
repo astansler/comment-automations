@@ -1,0 +1,8 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: automations_test
+    ports:
+      - "54329:5432"
