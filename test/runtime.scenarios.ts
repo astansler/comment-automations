@@ -516,7 +516,7 @@ export function runtimeScenarios(name: string, makeStore: MakeStore): void {
 
       expect((await h.tick()).effects).toMatchObject({ retrying: 1, deferred: 1, sent: 1 });
       expect(h.platform.sendCalls).toEqual(['run-0001:0:0', 'run-0003:0:0']);
-      expect(await store.tx((tx) => tx.getAccountThrottle(ACCOUNT))).toBe(T0 + 30_000);
+      expect(await store.tx((tx) => tx.getAccountThrottle(ACCOUNT, 'reply_to_comment'))).toBe(T0 + 30_000);
       expect(await h.effect('run-0001:0:0')).toMatchObject({ status: 'pending', attempts: 0, nextAttemptAt: T0 + 30_000 });
       expect(await h.effect('run-0002:0:0')).toMatchObject({ status: 'pending', attempts: 0 });
 
@@ -527,6 +527,29 @@ export function runtimeScenarios(name: string, makeStore: MakeStore): void {
       await h.runUntilIdle();
       const delivered = h.platform.deliveries.filter((d) => d.accountId === ACCOUNT).map((d) => d.key);
       expect(delivered.sort()).toEqual(['run-0001:0:0', 'run-0001:1:0', 'run-0002:0:0', 'run-0002:1:0']);
+    });
+
+    it('still delivers the link to someone who answered while the account is rate limited on first messages', async () => {
+      const h = setup();
+      const alice = await h.untilWaiting();
+      // A spike: bob's first DM hits the private-reply limit, and carol is queued behind it.
+      await h.comment('pricing', { from: 'bob' });
+      await h.comment('pricing', { from: 'carol' });
+      h.platform.inject({ kind: 'private_reply' }, fault.rateLimited(3_600_000));
+      await h.runUntilIdle();
+      expect(await store.tx((tx) => tx.getAccountThrottle(ACCOUNT, 'private_reply'))).toBe(T0 + 3_600_000);
+
+      // Alice answers during the throttle. Her link is an ordinary DM with its own limit and a 24-hour deadline.
+      await h.message('alice@example.com');
+      await h.runUntilIdle();
+      expect(await h.run(alice)).toMatchObject({ status: 'completed' });
+      expect(h.sent()).toContain(`direct_message: ${TEXT.link}`);
+      expect(h.platform.deliveries.filter((d) => d.kind === 'private_reply').map((d) => d.contactId)).toEqual([ALICE]);
+
+      h.clock.advance(3_600_000);
+      await h.runUntilIdle();
+      // The backlog goes out once the limit lifts.
+      expect(h.platform.deliveries.filter((d) => d.kind === 'private_reply').map((d) => d.contactId).sort()).toEqual([ALICE, 'bob', 'carol']);
     });
 
     it('gives up on a public reply after the last attempt and lets the run continue', async () => {

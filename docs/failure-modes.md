@@ -34,7 +34,8 @@ Each row is something that will happen in production, what the system does about
 | What happens | What the system does | Test |
 |---|---|---|
 | Temporary platform error | Back to pending with exponential backoff | `retries a retryable error after the backoff and delivers once` |
-| Rate limit | The account is throttled until retry-after; the attempt is not counted; other accounts are unaffected | `throttles a rate-limited account without counting the attempt, while other accounts keep sending` |
+| Rate limit | That kind of message is throttled for the account until retry-after; the attempt is not counted; other accounts are unaffected | `throttles a rate-limited account without counting the attempt, while other accounts keep sending` |
+| Someone answers while the account is rate limited on first messages | Their link still goes out: ordinary DMs have their own limit and are sent before the backlog, so it does not miss the 24-hour window | `still delivers the link to someone who answered while the account is rate limited on first messages` |
 | The public reply keeps failing | Given up; the run continues, because a courtesy comment must not cost the lead | `gives up on a public reply after the last attempt and lets the run continue` |
 | A DM keeps failing | The run fails with `retries_exhausted` | `fails the run when the link DM runs out of attempts` |
 | The person has blocked DMs, or the comment is gone | The run fails with the platform's code; the conversation is freed for the next queued run | `fails the run on a permanent DM error and promotes the queued run of the same conversation` |
@@ -85,3 +86,4 @@ Things I know are not handled, in rough order of how much I would worry about th
 7. **Cancel while a public reply's outcome is unknown.** The outbox row is marked failed (`run_ended`) although the reply may have been posted. Nothing is sent; the record can be wrong.
 8. **A run that always fails to load holds a slot in every timer batch.** Errors are isolated per item, so other timers still fire, but nothing parks the bad run; twenty of them would fill a batch. Needs a failure counter and an alert.
 9. **Rate-limit knowledge can be lost in a crash** between the platform's answer and our write. The next attempt rediscovers it.
+10. **The claim query gets slower as a backlog grows.** It orders every due row of every account to put ordinary DMs first and to step over throttled sends, so its cost follows the size of the due backlog, not the batch. Fine at a hundred thousand rows; beyond that it needs a priority column in the index and a per-account cursor.

@@ -117,17 +117,20 @@ export interface Tx {
   /**
    * Atomically claim up to `limit` effects that are due:
    *   (`pending` and `nextAttemptAt <= now`) or (`sending` and `leaseUntil <= now`),
-   * skipping accounts whose throttle is in the future and rows locked by other
-   * claimers (SKIP LOCKED). Claimed rows become `sending`, `attempts + 1`,
-   * `leaseUntil = now + leaseMs`. Ordered by `nextAttemptAt`, then key.
+   * skipping effects whose (account, kind) throttle is in the future and rows
+   * locked by other claimers (SKIP LOCKED). Claimed rows become `sending`,
+   * `attempts + 1`, `leaseUntil = now + leaseMs`. Kinds in `SENT_FIRST` come
+   * before the others; within each group, ordered by `nextAttemptAt`, then key.
    * The returned effects reflect the row *after* the claim.
    */
   claimDueEffects(now: Millis, limit: number, leaseMs: Millis): Promise<ClaimedEffect[]>;
 
   // -- account throttle --------------------------------------------------------
-  /** No effect of this account is claimed before `until`. Never moves the throttle earlier. */
-  setAccountThrottle(accountId: string, until: Millis): Promise<void>;
-  getAccountThrottle(accountId: string): Promise<Millis | null>;
+  // Per kind, because the platform limits each kind of send separately: hitting
+  // the private-reply limit says nothing about ordinary DMs.
+  /** No effect of this account and kind is claimed before `until`. Never moves the throttle earlier. */
+  setAccountThrottle(accountId: string, kind: EffectKind, until: Millis): Promise<void>;
+  getAccountThrottle(accountId: string, kind: EffectKind): Promise<Millis | null>;
 
   // -- leads and log -----------------------------------------------------------
   upsertLead(accountId: string, contactId: string, field: string, value: string, at: Millis): Promise<void>;

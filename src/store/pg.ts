@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import pg from 'pg';
-import type { AutomationDefinition, AutomationVersion, Run } from '../core/types.js';
+import { SENT_FIRST, type AutomationDefinition, type AutomationVersion, type Run } from '../core/types.js';
 import { StoreConflictError, type StoreConflictCode } from './errors.js';
 import type { ClaimedEffect, RunLogEntry, Store, StoredEffect, StoredMessage, Tx } from './store.js';
 
@@ -416,6 +416,7 @@ function openTx(client: pg.PoolClient): Tx {
       const returned = EFFECT_COLUMNS.split(', ')
         .map((c) => `e.${c}`)
         .join(', ');
+      // SENT_FIRST kinds sort before the rest (false < true).
       const { rows } = await client.query<EffectRow & { was_in_flight: boolean }>(
         `WITH due AS (
            SELECT e.key, e.status
@@ -424,8 +425,8 @@ function openTx(client: pg.PoolClient): Tx {
                OR (e.status = 'sending' AND e.lease_until <= $1))
              AND NOT EXISTS (
                SELECT 1 FROM account_throttles t
-               WHERE t.account_id = e.account_id AND t.throttled_until > $1)
-           ORDER BY e.next_attempt_at, e.key
+               WHERE t.account_id = e.account_id AND t.kind = e.kind AND t.throttled_until > $1)
+           ORDER BY e.kind <> ALL($4::text[]), e.next_attempt_at, e.key
            LIMIT $2
            FOR UPDATE OF e SKIP LOCKED
          ), claimed AS (
@@ -436,24 +437,24 @@ function openTx(client: pg.PoolClient): Tx {
            RETURNING ${returned}, due.status = 'sending' AS was_in_flight
          )
          SELECT ${EFFECT_COLUMNS}, was_in_flight FROM claimed
-         ORDER BY next_attempt_at, key`,
-        [now, limit, leaseMs],
+         ORDER BY kind <> ALL($4::text[]), next_attempt_at, key`,
+        [now, limit, leaseMs, SENT_FIRST],
       );
       return rows.map((r): ClaimedEffect => ({ effect: toEffect(r), wasInFlight: r.was_in_flight }));
     },
 
-    async setAccountThrottle(accountId, until) {
+    async setAccountThrottle(accountId, kind, until) {
       await client.query(
-        `INSERT INTO account_throttles (account_id, throttled_until) VALUES ($1, $2)
-         ON CONFLICT (account_id) DO UPDATE
+        `INSERT INTO account_throttles (account_id, kind, throttled_until) VALUES ($1, $2, $3)
+         ON CONFLICT (account_id, kind) DO UPDATE
          SET throttled_until = GREATEST(account_throttles.throttled_until, EXCLUDED.throttled_until)`,
-        [accountId, until],
+        [accountId, kind, until],
       );
     },
-    async getAccountThrottle(accountId) {
+    async getAccountThrottle(accountId, kind) {
       const row = await one<{ throttled_until: BigintText }>(
-        'SELECT throttled_until FROM account_throttles WHERE account_id = $1',
-        [accountId],
+        'SELECT throttled_until FROM account_throttles WHERE account_id = $1 AND kind = $2',
+        [accountId, kind],
       );
       return row && Number(row.throttled_until);
     },

@@ -180,6 +180,14 @@ export const DELIVERY_POLICY: Record<EffectKind, DeliveryPolicy> = {
   direct_message: 'at_least_once',
 };
 
+/**
+ * Kinds the outbox sends before the others. An ordinary DM only exists inside
+ * a conversation the contact has already answered, and it has a deadline the
+ * others do not have: the platform's 24-hour window, counted from the contact's
+ * last message. A first message to a new commenter can wait days; this cannot.
+ */
+export const SENT_FIRST: readonly EffectKind[] = ['direct_message'];
+
 /** What the engine asks the outside world to do. At most one per transition. */
 export interface EffectRequest {
   /** Deterministic idempotency key: `${runId}:${stepIndex}:${attempt}` (attempt 0 = the step's first send, n = nth reprompt). */

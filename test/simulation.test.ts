@@ -303,9 +303,9 @@ async function simulate(batchSize: number, actions: Action[]): Promise<void> {
         if (run === undefined || isTerminal(run.status)) {
           lateSends.push(`${effect.key} while run is ${run?.status ?? 'missing'}`);
         }
-        const throttle = committed.throttles.find((t) => t.accountId === effect.accountId);
+        const throttle = committed.throttles.find((t) => t.accountId === effect.accountId && t.kind === effect.kind);
         if (throttle !== undefined && clock.now() < throttle.until) {
-          throttleBreaches.push(`${effect.key} at ${clock.now()}, account throttled until ${throttle.until}`);
+          throttleBreaches.push(`${effect.key} at ${clock.now()}, ${effect.kind} throttled until ${throttle.until}`);
         }
       }
       // A second send of a key while the first is still in flight: a lapsed lease.

@@ -89,9 +89,13 @@ CREATE INDEX effects_pending_due ON effects (next_attempt_at) WHERE status = 'pe
 -- claimDueEffects: sending rows whose lease expired.
 CREATE INDEX effects_sending_lease ON effects (lease_until) WHERE status = 'sending';
 
+-- Per kind: the platform limits each kind of send separately, so hitting the
+-- private-reply limit must not hold back DMs to people who already answered.
 CREATE TABLE account_throttles (
-  account_id      text PRIMARY KEY,
-  throttled_until bigint NOT NULL
+  account_id      text NOT NULL,
+  kind            text NOT NULL CHECK (kind IN ('reply_to_comment', 'private_reply', 'direct_message')),
+  throttled_until bigint NOT NULL,
+  PRIMARY KEY (account_id, kind)
 );
 
 CREATE TABLE leads (

@@ -123,7 +123,7 @@ export function storeContract(name: string, makeStore: MakeStore): void {
             await tx.insertRun(aRun());
             await tx.insertMessage(aMessage());
             await tx.insertEffect(anEffect());
-            await tx.setAccountThrottle(ACCOUNT, 5_000);
+            await tx.setAccountThrottle(ACCOUNT, 'private_reply', 5_000);
             await tx.upsertLead(ACCOUNT, CONTACT, 'email', 'a@b.co', 1);
             await tx.appendRunLog('run-1', 1, 'started');
             throw boom;
@@ -136,7 +136,7 @@ export function storeContract(name: string, makeStore: MakeStore): void {
           expect(await tx.getRun('run-1')).toBeNull();
           expect(await tx.listUnconsumedMessages(ACCOUNT, CONTACT, 0)).toEqual([]);
           expect(await tx.getEffect('run-1:0:0')).toBeNull();
-          expect(await tx.getAccountThrottle(ACCOUNT)).toBeNull();
+          expect(await tx.getAccountThrottle(ACCOUNT, 'private_reply')).toBeNull();
           expect(await tx.getLeadFields(ACCOUNT, CONTACT)).toEqual({});
           expect(await tx.listRunLog('run-1')).toEqual([]);
         });
@@ -533,13 +533,38 @@ export function storeContract(name: string, makeStore: MakeStore): void {
           await store.tx(async (tx) => {
             await tx.insertEffect(anEffect({ key: 'throttled', accountId: 'acct-slow' }));
             await tx.insertEffect(anEffect({ key: 'free', accountId: 'acct-fast' }));
-            await tx.setAccountThrottle('acct-slow', NOW + 5_000);
+            await tx.setAccountThrottle('acct-slow', anEffect().kind, NOW + 5_000);
           });
           const now = await store.tx((tx) => tx.claimDueEffects(NOW, 10, LEASE));
           expect(now.map((c) => c.effect.key)).toEqual(['free']);
           expect(await store.tx((tx) => tx.claimDueEffects(NOW + 4_999, 10, LEASE))).toEqual([]);
           const later = await store.tx((tx) => tx.claimDueEffects(NOW + 5_000, 10, LEASE));
           expect(later.map((c) => c.effect.key)).toEqual(['throttled']);
+        });
+
+        it('throttles one kind of send without holding back the account\'s other kinds', async () => {
+          await store.tx(async (tx) => {
+            await tx.insertEffect(anEffect({ key: 'first-message', kind: 'private_reply' }));
+            await tx.insertEffect(anEffect({ key: 'the-link', kind: 'direct_message' }));
+            await tx.setAccountThrottle(ACCOUNT, 'private_reply', NOW + 5_000);
+          });
+          const now = await store.tx((tx) => tx.claimDueEffects(NOW, 10, LEASE));
+          expect(now.map((c) => c.effect.key)).toEqual(['the-link']);
+          const later = await store.tx((tx) => tx.claimDueEffects(NOW + 5_000, 10, LEASE));
+          expect(later.map((c) => c.effect.key)).toEqual(['first-message']);
+        });
+
+        it('claims ordinary DMs before older first messages, so an open conversation is not stuck behind a backlog', async () => {
+          await store.tx(async (tx) => {
+            await tx.insertEffect(anEffect({ key: 'backlog-1', kind: 'private_reply', nextAttemptAt: 1_000 }));
+            await tx.insertEffect(anEffect({ key: 'backlog-2', kind: 'reply_to_comment', nextAttemptAt: 2_000 }));
+            await tx.insertEffect(anEffect({ key: 'link-b', kind: 'direct_message', nextAttemptAt: 4_000 }));
+            await tx.insertEffect(anEffect({ key: 'link-a', kind: 'direct_message', nextAttemptAt: 3_000 }));
+          });
+          const first = await store.tx((tx) => tx.claimDueEffects(NOW, 3, LEASE));
+          expect(first.map((c) => c.effect.key)).toEqual(['link-a', 'link-b', 'backlog-1']);
+          const rest = await store.tx((tx) => tx.claimDueEffects(NOW, 3, LEASE));
+          expect(rest.map((c) => c.effect.key)).toEqual(['backlog-2']);
         });
 
         it('a claimed effect is not claimed again before its lease expires', async () => {
@@ -556,14 +581,15 @@ export function storeContract(name: string, makeStore: MakeStore): void {
     describe('account throttle', () => {
       it('is null until set, and never moves earlier', async () => {
         await store.tx(async (tx) => {
-          expect(await tx.getAccountThrottle(ACCOUNT)).toBeNull();
-          await tx.setAccountThrottle(ACCOUNT, 5_000);
-          expect(await tx.getAccountThrottle(ACCOUNT)).toBe(5_000);
-          await tx.setAccountThrottle(ACCOUNT, 4_000);
-          expect(await tx.getAccountThrottle(ACCOUNT)).toBe(5_000);
-          await tx.setAccountThrottle(ACCOUNT, 6_000);
-          expect(await tx.getAccountThrottle(ACCOUNT)).toBe(6_000);
-          expect(await tx.getAccountThrottle('acct-2')).toBeNull();
+          expect(await tx.getAccountThrottle(ACCOUNT, 'private_reply')).toBeNull();
+          await tx.setAccountThrottle(ACCOUNT, 'private_reply', 5_000);
+          expect(await tx.getAccountThrottle(ACCOUNT, 'private_reply')).toBe(5_000);
+          await tx.setAccountThrottle(ACCOUNT, 'private_reply', 4_000);
+          expect(await tx.getAccountThrottle(ACCOUNT, 'private_reply')).toBe(5_000);
+          await tx.setAccountThrottle(ACCOUNT, 'private_reply', 6_000);
+          expect(await tx.getAccountThrottle(ACCOUNT, 'private_reply')).toBe(6_000);
+          expect(await tx.getAccountThrottle(ACCOUNT, 'direct_message')).toBeNull();
+          expect(await tx.getAccountThrottle('acct-2', 'private_reply')).toBeNull();
         });
       });
     });

@@ -1,12 +1,12 @@
 # Testing
 
-239 tests in four layers. Everything runs with `npm test`; the Postgres layers need `DATABASE_URL` and skip without it.
+245 tests in four layers. Everything runs with `npm test`; the Postgres layers need `DATABASE_URL` and skip without it.
 
 | Layer | Files | What it is for |
 |---|---|---|
 | Engine | `engine.test.ts`, `engine.properties.test.ts` | The pure `transition` function: 69 example tests and 6 properties, each over 500 random definitions and event sequences |
-| Stores | `store.contract.ts` run by `store.memory.test.ts` and `store.pg.test.ts` | One suite of 40 tests that both stores must pass, plus Postgres tests with separate connections for locking and `SKIP LOCKED` |
-| Scenarios | `runtime.scenarios.ts` run on both stores | 35 named situations, each asserting the run's state and what the fake platform actually received |
+| Stores | `store.contract.ts` run by `store.memory.test.ts` and `store.pg.test.ts` | One suite of 42 tests that both stores must pass, plus Postgres tests with separate connections for locking and `SKIP LOCKED` |
+| Scenarios | `runtime.scenarios.ts` run on both stores | 36 named situations, each asserting the run's state and what the fake platform actually received |
 | Adversarial | `simulation.test.ts`, `concurrency.pg.test.ts` | Randomized whole-system simulation with crash injection; real concurrency on Postgres |
 
 The fake platform ([`test/support/fakePlatform.ts`](../test/support/fakePlatform.ts)) enforces the two Instagram rules the design depends on: a second private reply to the same comment is refused, and a DM to someone who has not written is refused. A test cannot pass by doing something the real platform would reject.
@@ -44,7 +44,7 @@ It is deterministic. A failure prints a seed and path, and `SIM_SEED=<seed> SIM_
 | I11 | A question marked `skipIfKnown` is never sent to someone whose answer was already stored when the run started. |
 | I12 | A settled message never changes again. Checked after every commit. |
 | I13 | A run never expires before its question's timeout has elapsed since the question was delivered. |
-| I14 | No send starts for an account while a recorded throttle for it is in the future. |
+| I14 | No send starts while a recorded throttle for its account and kind of message is in the future. |
 | I15 | A failed public reply never ends a run. |
 | Liveness | With faults switched off, ticking and advancing the clock reaches a state where every run has ended and every message is sent or failed. |
 

@@ -1,4 +1,4 @@
-import { isActive, type AutomationVersion, type Millis, type Run } from '../core/types.js';
+import { isActive, SENT_FIRST, type AutomationVersion, type EffectKind, type Millis, type Run } from '../core/types.js';
 import { StoreConflictError } from './errors.js';
 import type { ClaimedEffect, RunLogEntry, Store, StoredEffect, StoredMessage, Tx } from './store.js';
 
@@ -20,12 +20,14 @@ export interface MemorySnapshot {
   messages: StoredMessage[];
   leads: { accountId: string; contactId: string; field: string; value: string }[];
   runLog: RunLogEntry[];
-  throttles: { accountId: string; until: Millis }[];
+  throttles: { accountId: string; kind: EffectKind; until: Millis }[];
 }
 
 const copy = <T>(value: T): T => structuredClone(value);
 const conversationKey = (accountId: string, contactId: string): string => JSON.stringify([accountId, contactId]);
 /** Code-unit order, matching the `COLLATE "C"` id columns in Postgres. */
+const throttleKey = (accountId: string, kind: EffectKind): string => JSON.stringify([accountId, kind]);
+const sendRank = (kind: EffectKind): number => (SENT_FIRST.includes(kind) ? 0 : 1);
 const compareIds = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
 function emptyState(): State {
@@ -167,15 +169,15 @@ function openTx(s: State): Tx {
       s.effects.set(effect.key, copy(effect));
     },
     async claimDueEffects(now, limit, leaseMs) {
-      const throttled = (accountId: string) => (s.throttles.get(accountId) ?? -Infinity) > now;
+      const throttled = (e: StoredEffect) => (s.throttles.get(throttleKey(e.accountId, e.kind)) ?? -Infinity) > now;
       const due = [...s.effects.values()]
         .filter(
           (e) =>
             ((e.status === 'pending' && e.nextAttemptAt <= now) ||
               (e.status === 'sending' && e.leaseUntil !== null && e.leaseUntil <= now)) &&
-            !throttled(e.accountId),
+            !throttled(e),
         )
-        .sort((a, b) => a.nextAttemptAt - b.nextAttemptAt || compareIds(a.key, b.key))
+        .sort((a, b) => sendRank(a.kind) - sendRank(b.kind) || a.nextAttemptAt - b.nextAttemptAt || compareIds(a.key, b.key))
         .slice(0, limit);
       return due.map((e): ClaimedEffect => {
         const wasInFlight = e.status === 'sending';
@@ -187,11 +189,12 @@ function openTx(s: State): Tx {
       });
     },
 
-    async setAccountThrottle(accountId, until) {
-      s.throttles.set(accountId, Math.max(s.throttles.get(accountId) ?? -Infinity, until));
+    async setAccountThrottle(accountId, kind, until) {
+      const key = throttleKey(accountId, kind);
+      s.throttles.set(key, Math.max(s.throttles.get(key) ?? -Infinity, until));
     },
-    async getAccountThrottle(accountId) {
-      return s.throttles.get(accountId) ?? null;
+    async getAccountThrottle(accountId, kind) {
+      return s.throttles.get(throttleKey(accountId, kind)) ?? null;
     },
 
     async upsertLead(accountId, contactId, field, value) {
@@ -238,7 +241,10 @@ export function createMemoryStore(): Store & { snapshot(): MemorySnapshot } {
           return Object.entries(fields).map(([field, value]) => ({ accountId, contactId, field, value }));
         }),
         runLog: state.runLog,
-        throttles: [...state.throttles].map(([accountId, until]) => ({ accountId, until })),
+        throttles: [...state.throttles].map(([key, until]) => {
+          const [accountId, kind] = JSON.parse(key) as [string, EffectKind];
+          return { accountId, kind, until };
+        }),
       });
     },
   };

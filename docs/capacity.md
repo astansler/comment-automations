@@ -60,13 +60,14 @@ What I would not do at any of these stages is adopt a workflow engine. The run m
 
 Meta's limit for private replies to comments on posts and reels is **750 calls per hour per Instagram account**. That is 18,000 a day, and about 126,000 inside the 7 days in which a comment can still receive its private reply.
 
-A viral reel with 100,000 matching comments in one hour therefore takes more than five days to work through, whatever we build. So during a spike the system has four jobs:
+A viral reel with 100,000 matching comments in one hour therefore takes more than five days to work through, whatever we build. So during a spike the system has five jobs:
 
 | Job | How |
 |---|---|
 | Absorb | Ingest is one small transaction per comment. 30 comments a second from one account is nothing. Runs are created `queued` or go straight to the outbox. |
-| Pace | Today: a rate-limit response throttles the account until the platform's retry-after, and the attempt is not counted against the message. Next: a token bucket per account so we rarely hit the limit at all. |
-| Stay fair | The throttle is per account, and the outbox claim skips throttled accounts, so one customer's backlog never delays another's sends. A per-account cap on claimed rows per batch would make that a guarantee rather than a tendency. |
+| Pace | Today: a rate-limit response throttles that kind of send for the account until the platform's retry-after, and the attempt is not counted against the message. Next: a token bucket per account so we rarely hit the limit at all. |
+| Finish what was started | The throttle is per kind, so the private-reply limit does not stop ordinary DMs, and the outbox claims ordinary DMs first. Someone who gave their email during the spike gets the link at once, not after the backlog, which would be past the 24-hour window. |
+| Stay fair | The throttle is per account and kind, and the outbox claim skips throttled sends, so one customer's backlog never delays another's sends. A per-account cap on claimed rows per batch would make that a guarantee rather than a tendency. |
 | Shed and report | A matched comment that cannot be reached within 7 days should be marked expired up front, and the customer should see "12,400 queued, about 16 hours" in the product. Not built. |
 
 The backlog order (newest first converts better, oldest first loses fewer to the deadline) is a product decision; see the open questions in the README.

@@ -24,7 +24,7 @@ The brief asks for a design, not code. The code is here because "a reply racing 
 | [`docs/capacity.md`](docs/capacity.md) | Load estimates by stage, spikes, and what changes when |
 | [`docs/testing.md`](docs/testing.md) | The invariants checked, the two bugs the simulation found, and the mutation results |
 | [`src/`](src) | About 2,200 lines of TypeScript and SQL: the pure engine, the Postgres schema and store, the runtime |
-| [`test/`](test) | 239 tests: unit, property, scenario, randomized simulation, and real-Postgres concurrency |
+| [`test/`](test) | 245 tests: unit, property, scenario, randomized simulation, and real-Postgres concurrency |
 | [`AI-USAGE.md`](AI-USAGE.md) | What I did myself and where I used AI |
 
 ```bash
@@ -89,7 +89,7 @@ Everything else (durable waits, retries, webhook redelivery) is ordinary and sol
 | **Versioned JSON, linear steps** | Graph for a visual builder; embedded scripting | Linear covers the product today. The document is small enough for a customer's agent to write over the API and is checked like a program at publish. | No branching and no delays. "If they don't answer, do something else" cannot be expressed yet. |
 | **One `ask` step** | Separate `send_dm` and `wait`, as the brief lists them | A wait with no question has nothing to correlate a reply with, and "skip if we already know their email" must skip the question too. | One step type carries six options. |
 | **Polling workers with leases** | LISTEN/NOTIFY; a message broker | Workers hold no state. A dead worker needs no operator: its rows are reclaimed when the lease expires. | A dead worker's message waits up to 60 seconds. A platform call must finish inside its lease, so the adapter's request timeout has to be shorter. |
-| **Reactive throttling** | A proactive token bucket per account | The limit is told to us by the platform, so it cannot go stale in our config. | We find the limit by hitting it. The token bucket is designed and is the next thing to build. |
+| **Reactive throttling, per kind of message** | A proactive token bucket per account; one throttle for the whole account | The limit is told to us by the platform, so it cannot go stale in our config. Each kind has its own limit, and one account-wide throttle would let the private-reply limit delay links past their 24-hour window. | We find the limit by hitting it. The token bucket is designed and is the next thing to build. |
 
 ## 4. Architecture
 
@@ -142,7 +142,7 @@ Three ideas hold this together:
 | `cancelRun(runId, reason)` | The API | `cancelled`, `already_ended`, `not_found` |
 | `tick()` | The worker loop | A report: effects sent, failed, retried, deferred, in doubt; timers fired |
 
-**Inside**, persistence is one contract ([`src/store/store.ts`](src/store/store.ts)) with two implementations, Postgres and in-memory, that pass the same 40 tests. The in-memory store is a second implementation, not a mock, which is why the simulation that runs on it can be trusted.
+**Inside**, persistence is one contract ([`src/store/store.ts`](src/store/store.ts)) with two implementations, Postgres and in-memory, that pass the same 42 tests. The in-memory store is a second implementation, not a mock, which is why the simulation that runs on it can be trusted.
 
 ## 6. The automation model, and how general it is
 
@@ -188,7 +188,7 @@ Full DDL with a comment on every index: [`src/store/schema.sql`](src/store/schem
 | `runs` | One execution for one commenter: status, step index, captured fields, deadline | Unique `(account, trigger comment)`: **a comment starts at most one run**. Partial unique `(account, contact)` where status is active: **one owner per conversation** |
 | `messages` | Every inbound DM, with which run consumed it (or none) | Primary key on the platform message ID |
 | `effects` | The outbox and the permanent ledger of every send | Primary key is the idempotency key `run:step:attempt` |
-| `account_throttles` | "Do not send for this account before T" | Only ever moves later |
+| `account_throttles` | "Do not send this kind of message for this account before T" | Only ever moves later |
 | `leads` | Captured fields per contact (PII) | |
 | `run_log` | Append-only story of each run | |
 
@@ -272,7 +272,8 @@ The complete list, with the test for each row, is in [`docs/failure-modes.md`](d
 - **Two workers, one message.** `SKIP LOCKED` hands each due row to one claimer. Settling re-checks the row under the conversation lock, and the engine ignores a result whose key is not the one the run is waiting on, so even a double settle changes nothing.
 - **A worker holds a claim too long.** A batch is claimed under one lease and sent one message at a time. Before each send the worker checks its lease is still valid, and gives the message back if not. Every write back to the outbox is fenced on the attempt counter, so a slow worker cannot overwrite a newer claim.
 - **The database fails under a worker.** One failed write does not stop the pass or the worker loop. The rest of the batch and the due timers are still processed, the error is reported, and the item that failed is in the same state as after a crash, so the same delivery policy recovers it.
-- **Rate limits.** A rate-limit response throttles the whole account until the platform's retry-after, does not count against the message's attempts, and does not affect other accounts.
+- **Rate limits.** A rate-limit response throttles that kind of message for that account until the platform's retry-after. It does not count against the message's attempts and does not affect other accounts. It also does not hold back the account's other kinds: the platform limits them separately, and the link owed to someone who already answered must not wait behind the private-reply limit.
+- **A backlog of first messages.** The outbox sends ordinary DMs before first messages. A DM belongs to a conversation the person has already answered and must go out within 24 hours of their last message; a first message has 7 days. Without this, a link would queue behind every unanswered comment of a viral post and miss its window.
 - **Permanent failures** (blocked DMs, deleted comment, revoked token) end the run with the platform's code in the log, and free the conversation for the next queued run.
 - **Our own reply re-triggering the automation.** "Sent you a DM!" comes back as a comment webhook. Comments authored by the account never match.
 - **The same person commenting five times.** One run per comment, plus a per-automation cooldown per contact.
@@ -314,7 +315,7 @@ One run of the example costs about 8 transactions, 25 row writes and 3 platform 
 
 Sharding by account is mechanical: every query and every lock is already scoped to an account or a conversation, and no transaction spans two accounts. A workflow engine is not needed at any of these stages.
 
-**Spikes.** A reel with 100,000 matching comments in an hour takes more than five days to answer at 750 private replies an hour, whatever is built. During a spike the system absorbs (one small transaction per comment), paces (throttle per account), stays fair (the outbox skips throttled accounts, so one backlog never delays another customer), and should tell the customer how long the backlog is (not built).
+**Spikes.** A reel with 100,000 matching comments in an hour takes more than five days to answer at 750 private replies an hour, whatever is built. During a spike the system absorbs (one small transaction per comment), paces (throttle per account), finishes what it started (the limit on first messages does not stop the link going to people who answered, and those DMs are sent first), stays fair (the outbox skips throttled sends, so one backlog never delays another customer), and should tell the customer how long the backlog is (not built).
 
 ## 12. Built, and not built
 

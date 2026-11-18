@@ -77,7 +77,7 @@ export type EffectOutcome =
   | 'failed'
   /** Back to `pending` for a later attempt. */
   | 'retrying'
-  /** Not attempted, back to `pending`: an earlier effect in the same tick hit this account's rate limit, or the claim's lease lapsed before its turn. */
+  /** Not attempted, back to `pending`: an earlier effect of the same kind in the same tick hit this account's rate limit, or the claim's lease lapsed before its turn. */
   | 'deferred'
   /** Left `sending` after an unknown outcome; reconciled once its lease lapses. */
   | 'in_doubt'
@@ -292,8 +292,8 @@ export function createRuntime(deps: {
   async function reschedule(claimed: StoredEffect, retry: Retry): Promise<EffectOutcome> {
     return store.tx(async (tx) => {
       const at = now();
-      // The platform told us about the account, whoever owns this row now.
-      if (retry.throttleMs !== null) await tx.setAccountThrottle(claimed.accountId, at + retry.throttleMs);
+      // The platform told us about the account's limit for this kind of send, whoever owns this row now.
+      if (retry.throttleMs !== null) await tx.setAccountThrottle(claimed.accountId, claimed.kind, at + retry.throttleMs);
       const current = await tx.getEffect(claimed.key);
       if (current?.status !== 'sending' || current.attempts !== claimed.attempts) return 'superseded';
       await tx.updateEffect({
@@ -308,6 +308,9 @@ export function createRuntime(deps: {
       return 'retrying';
     });
   }
+
+  /** The platform limits each kind of send per account separately. */
+  const limitOf = (effect: StoredEffect): string => JSON.stringify([effect.accountId, effect.kind]);
 
   async function deliver({ effect, wasInFlight }: ClaimedEffect, throttled: Set<string>): Promise<EffectOutcome> {
     // Unlocked read: a terminal status never changes, so "ended" cannot be stale.
@@ -324,9 +327,9 @@ export function createRuntime(deps: {
       }
     }
 
-    if (throttled.has(effect.accountId)) {
-      // Claimed in the same batch as an effect that just hit the account's rate
-      // limit; sending would only hit it again. The throttle keeps it unclaimed.
+    if (throttled.has(limitOf(effect))) {
+      // Claimed in the same batch as an effect of the same kind that just hit the
+      // account's rate limit; sending would only hit it again. The throttle keeps it unclaimed.
       // Only after reconcile: back in `pending` it would lose its wasInFlight.
       const outcome = await reschedule(effect, {
         delayMs: null,
@@ -387,7 +390,7 @@ export function createRuntime(deps: {
         return settle(effect, { status: 'failed', code: error.code });
       case 'retryable': {
         const rateLimited = error.rateLimited === true;
-        if (rateLimited) throttled.add(effect.accountId);
+        if (rateLimited) throttled.add(limitOf(effect));
         return reschedule(effect, {
           delayMs: error.retryAfterMs ?? config.backoffMs(effect.attempts),
           lastError: error.code,
