@@ -31,7 +31,7 @@ import {
   type Run,
 } from '../src/core/types.js';
 import type { PlatformAdapter, SendResult } from '../src/runtime/adapter.js';
-import { createRuntime, isIdle, type Runtime, type RuntimeConfig } from '../src/runtime/runtime.js';
+import { createRuntime, isIdle, TickError, type Runtime, type RuntimeConfig } from '../src/runtime/runtime.js';
 import { createMemoryStore, type MemorySnapshot } from '../src/store/memory.js';
 import type { StoredEffect } from '../src/store/store.js';
 import { createFaultyStore, CrashError, type CrashMode } from './support/faultyStore.js';
@@ -371,13 +371,13 @@ async function simulate(batchSize: number, actions: Action[]): Promise<void> {
       await call();
       return 'ok';
     } catch (err) {
-      if (err instanceof CrashError) {
-        hit(`crash ${err.mode} commit`);
-        noteCrash();
-        return 'crashed';
-      }
-      unexpected.push(err);
-      return 'ok';
+      // A worker pass isolates failures per item, so one pass can meet two armed crashes.
+      const errors: unknown[] = err instanceof TickError ? err.errors : [err];
+      const crashes = errors.filter((e) => e instanceof CrashError);
+      for (const crash of crashes) hit(`crash ${crash.mode} commit`);
+      if (crashes.length > 0) noteCrash();
+      unexpected.push(...errors.filter((e) => !(e instanceof CrashError)));
+      return crashes.length > 0 ? 'crashed' : 'ok';
     }
   }
 
@@ -669,8 +669,10 @@ async function simulate(batchSize: number, actions: Action[]): Promise<void> {
 
     // I6. A consumed message was consumed by a run of its own conversation that had started
     //     at or before the message's receivedAt; a run consumes at most maxAttempts messages
-    //     per ask step; and no run expires while a reply it could have used sits unconsumed
-    //     (a message of its conversation, stored before the expiry, with receivedAt >= startedAt).
+    //     per ask step; and no run expires while a reply it could have used sits unconsumed:
+    //     a message of its conversation, stored before the expiry, received since the run
+    //     started, and either written after the question was enqueued or carrying the email
+    //     the question asks for (an earlier message that is not the answer is left alone).
     {
       const consumedBy = new Map<string, number>();
       for (const m of snap.messages) {
@@ -708,6 +710,9 @@ async function simulate(batchSize: number, actions: Action[]): Promise<void> {
       const storedBefore = new Set(before.messages.map((m) => m.id));
       for (const r of snap.runs) {
         if (r.status !== 'expired' || terminalSeen.has(r.id)) continue;
+        const automation = r.automationId.slice(r.accountId.length + 1) as keyof typeof DEFINITIONS;
+        const step = DEFINITIONS[automation].steps[r.stepIndex];
+        const askedAt = effectsByKey.get(`${r.id}:${r.stepIndex}:0`)?.createdAt ?? Infinity;
         const lost = snap.messages.find(
           (m) =>
             storedBefore.has(m.id) &&
@@ -715,7 +720,9 @@ async function simulate(batchSize: number, actions: Action[]): Promise<void> {
             m.accountId === r.accountId &&
             m.contactId === r.contactId &&
             r.startedAt !== null &&
-            m.receivedAt >= r.startedAt,
+            m.receivedAt >= r.startedAt &&
+            (m.receivedAt >= askedAt ||
+              (step?.type === 'ask' && step.capture === 'email' && extractEmail(m.text) !== null)),
         );
         if (lost !== undefined) violation('I6', `${ctx}: run ${r.id} expired while message ${lost.id} waited unconsumed`);
       }

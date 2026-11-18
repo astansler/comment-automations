@@ -359,3 +359,35 @@ describe('extractEmail', () => {
     expect(extractEmail(text)).toBe(expected);
   });
 });
+
+describe('transition: a message written before the question was asked', () => {
+  const early = (text: string): RunEvent => ({ type: 'message_received', messageId: 'm', text, beforePrompt: true });
+
+  it('is not a failed attempt when it does not contain the answer', () => {
+    const run = waitingOnEmail();
+    const r = transition(pricing, run, early('hi there'), T0 + 5);
+    expect(r).toMatchObject({ consumed: false, effect: null, captured: null });
+    expect(r.run).toMatchObject({ status: 'waiting_reply', attempt: 0, wakeAt: run.wakeAt, windowOpen: true });
+  });
+
+  it('changes nothing at all once the window is already open', () => {
+    const run = { ...waitingOnEmail(), windowOpen: true };
+    expect(transition(pricing, run, early('hi there'), T0 + 5).run).toBe(run);
+  });
+
+  it('still answers the question when it contains the email', () => {
+    const r = transition(pricing, waitingOnEmail(), early('it is jane@example.com'), T0 + 5);
+    expect(r).toMatchObject({ consumed: true, captured: { field: 'email', value: 'jane@example.com' } });
+    expect(r.effect).toMatchObject({ key: 'r1:2:0', kind: 'direct_message' });
+  });
+
+  it('never answers a free-text question, which anything would satisfy', () => {
+    const definition = definitionOf(ask({ capture: 'any', saveAs: 'company' }), { type: 'send_dm', text: 'ok' });
+    const waiting = last(drive(definition, queued(definition), [[start, T0], [ok('r1:0:0'), T0 + 1]])).run;
+    expect(waiting.status).toBe('waiting_reply');
+    const r = transition(definition, waiting, early('hello'), T0 + 5);
+    expect(r).toMatchObject({ consumed: false, captured: null, effect: null });
+    expect(r.run.status).toBe('waiting_reply');
+    expect(transition(definition, r.run, msg('Acme'), T0 + 6)).toMatchObject({ consumed: true, captured: { field: 'company', value: 'Acme' } });
+  });
+});

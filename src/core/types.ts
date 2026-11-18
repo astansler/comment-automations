@@ -150,7 +150,12 @@ export type RunEvent =
   | { type: 'effect_succeeded'; key: string }
   /** The outbox gave up on the effect: permanent error or retries exhausted. */
   | { type: 'effect_failed'; key: string; code: string }
-  | { type: 'message_received'; messageId: string; text: string }
+  /**
+   * `beforePrompt`: the message was written before the current question was
+   * asked (it is being replayed from storage). It answers the question only if
+   * it plainly is the answer; otherwise the run leaves it alone.
+   */
+  | { type: 'message_received'; messageId: string; text: string; beforePrompt?: boolean }
   | { type: 'timer_fired' }
   | { type: 'cancel'; reason: string };
 

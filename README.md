@@ -9,7 +9,7 @@ This is the system design for that feature, with a reference implementation of t
 - **Running four steps in order is not the problem.** Two properties of the platform are: a typed reply does not say which question it answers, and a send cannot be safely repeated. The design is organised around those two.
 - **Postgres is the only moving part.** A run is a row. A state change and the message it causes commit in one transaction. No queue, no workflow engine, nothing new to operate for a team of three.
 - **The behaviour of a run is one pure function.** `transition(definition, run, event, now)` does no I/O and never throws, so it is tested with thousands of random inputs and every failure replays from a seed.
-- **The conversation is the lock.** One lock per (account, commenter) orders comments, replies, send results and timeouts. One run owns a conversation at a time; others queue.
+- **Concurrency is handled per conversation.** One lock per (account, commenter) orders comments, replies, send results and timeouts. One run owns a conversation at a time; others queue.
 - **Delivery is decided per kind of message.** A duplicate public comment and a duplicate link do not cost the same, so they do not get the same guarantee.
 - **Every decision has its price written next to it** ([section 3](#3-decisions-and-what-each-one-costs)), and every claim that can be tested is tested. A randomized simulation found two real bugs in code that already passed 216 tests ([section 10](#10-what-the-tests-found)).
 
@@ -24,7 +24,7 @@ The brief asks for a design, not code. The code is here because "a reply racing 
 | [`docs/capacity.md`](docs/capacity.md) | Load estimates by stage, spikes, and what changes when |
 | [`docs/testing.md`](docs/testing.md) | The invariants checked, the two bugs the simulation found, and the mutation results |
 | [`src/`](src) | About 2,200 lines of TypeScript and SQL: the pure engine, the Postgres schema and store, the runtime |
-| [`test/`](test) | 228 tests: unit, property, scenario, randomized simulation, and real-Postgres concurrency |
+| [`test/`](test) | 239 tests: unit, property, scenario, randomized simulation, and real-Postgres concurrency |
 | [`AI-USAGE.md`](AI-USAGE.md) | What I did myself and where I used AI |
 
 ```bash
@@ -171,7 +171,7 @@ Three step types: `reply_to_comment`, `send_dm`, `ask`. That is deliberately all
 - A new trigger (story reply, new follower) is a new `matchesTrigger` variant; runs do not care what started them.
 - Branching would replace "next step is `i + 1`" with a `next` field. The run already stores a step index, so in-flight runs survive that change.
 
-**Definitions are data, and are checked like programs.** Because a comment has one private reply and ordinary DMs need the person to have written back, `[send_dm, send_dm]` can never work: the platform would reject the second message. The validator runs a small abstract interpretation over the steps, tracking the reachable set of `(privateReplyUsed, windowOpen)` states and forking at every `ask` that may be skipped. A definition is accepted only if no path needs a second private reply, so an invalid program is rejected at publish and not at 3am. A property test then checks the engine against the validator: for any accepted definition and any event sequence, the engine never emits a second private reply.
+**Definitions are data, and are checked like programs.** Because a comment has one private reply and ordinary DMs need the person to have written back, `[send_dm, send_dm]` can never work: the platform would reject the second message. The validator runs a small abstract interpretation over the steps, tracking the reachable set of `(privateReplyUsed, windowOpen)` states and forking at every `ask` that may be skipped. A definition is accepted only if no path needs a second private reply, so an invalid program is rejected when it is published, not when it runs. A property test then checks the engine against the validator: for any accepted definition and any event sequence, the engine never emits a second private reply.
 
 This is also why `ask` is one step. In the first draft the question and the wait were separate, and `skipIfKnown` on the wait meant the question was still sent, used up the one private reply, and the link could never be delivered. Merging them removed the bug by construction.
 
@@ -247,7 +247,7 @@ No transaction is open during a platform call. A crash can therefore only fall b
 
 **Waiting costs nothing.** A reply and a timeout are two events through the same locked transition: whichever commits first moves the run, and the other finds a run it no longer applies to and does nothing.
 
-**Correlating replies.** Every inbound DM is stored first, unconsumed. If the conversation has an active run that is waiting, it consumes the message. If the run is not waiting yet (the person answered faster than the platform acknowledged our question), the message stays unconsumed, and the moment the run enters `waiting_reply` it drains unconsumed messages received since it started. Arrival order stops mattering. If no run owns the conversation, the message is left for the human inbox.
+**Correlating replies.** Every inbound DM is stored first, unconsumed. If the conversation has an active run that is waiting, it consumes the message. If the run is not waiting yet (the person answered faster than the platform acknowledged our question), the message stays unconsumed, and the moment the run enters `waiting_reply` it drains unconsumed messages received since it started. Arrival order stops mattering. One distinction is kept: a stored message written before the question was enqueued ("hi", sent while the public reply was going out) is used only if it plainly contains the answer, such as an email sent unprompted. Otherwise it is not a failed attempt; it stays unconsumed and the person is not told "that is not an email" about a question they had not seen. If no run owns the conversation, the message is left for the human inbox.
 
 **A second automation for the same person** is created `queued`. When the owner finishes, the next queued run is promoted in the same transaction. If it would ask for something we now know, `skipIfKnown` skips the question and its link goes out as that comment's private reply.
 
@@ -271,6 +271,7 @@ The complete list, with the test for each row, is in [`docs/failure-modes.md`](d
 - **A worker dies mid-send.** The outbox row stays `sending` with a lease. When the lease expires another worker claims it, sees that a previous attempt may have reached the platform, and applies the policy above.
 - **Two workers, one message.** `SKIP LOCKED` hands each due row to one claimer. Settling re-checks the row under the conversation lock, and the engine ignores a result whose key is not the one the run is waiting on, so even a double settle changes nothing.
 - **A worker holds a claim too long.** A batch is claimed under one lease and sent one message at a time. Before each send the worker checks its lease is still valid, and gives the message back if not. Every write back to the outbox is fenced on the attempt counter, so a slow worker cannot overwrite a newer claim.
+- **The database fails under a worker.** One failed write does not stop the pass or the worker loop. The rest of the batch and the due timers are still processed, the error is reported, and the item that failed is in the same state as after a crash, so the same delivery policy recovers it.
 - **Rate limits.** A rate-limit response throttles the whole account until the platform's retry-after, does not count against the message's attempts, and does not affect other accounts.
 - **Permanent failures** (blocked DMs, deleted comment, revoked token) end the run with the platform's code in the log, and free the conversation for the next queued run.
 - **Our own reply re-triggering the automation.** "Sent you a DM!" comes back as a comment webhook. Comments authored by the account never match.
@@ -305,9 +306,11 @@ One run of the example costs about 8 transactions, 25 row writes and 3 platform 
 
 | Stage | Accounts using it | Runs / day | Row writes at peak | What changes |
 |---|---|---|---|---|
-| Today | 1,000 | 50,000 | 150 / s | Nothing. One Postgres, two worker dynos for redundancy. |
+| Today | 1,000 | 50,000 | 150 / s | Nothing in the design. One Postgres. Worker count is set by sends, not writes: see below. |
 | 10× | 10,000 | 500,000 | 1,500 / s | Partition the log tables by month. Same shape. |
 | 100× | 100,000 | 5,000,000 | 15,000 / s | Take the run log off row-by-row writes, put webhook ingest behind a queue, shard by account. |
+
+**Sends are the tighter limit, not writes.** A worker sends one message at a time, so its throughput is one platform call's latency: about 3 sends a second if a call takes 300 ms (an assumption). Today's stage averages under 2 sends a second and peaks near 17, so two workers cover the average and the peak needs about six, or sends made concurrently inside a worker. Adding workers needs no change (`SKIP LOCKED`, tested with four at once); concurrent sends inside one worker are not built.
 
 Sharding by account is mechanical: every query and every lock is already scoped to an account or a conversation, and no transaction spans two accounts. A workflow engine is not needed at any of these stages.
 
@@ -323,6 +326,7 @@ Sharding by account is mechanical: every query and every lock is already scoped 
 | Runtime: ingest, outbox worker, timers, crash recovery, queueing, cancel | Reconciliation poll for missed webhooks |
 | Fake platform that enforces the private-reply and messaging-window rules | Backlog ordering and shedding policy for spikes |
 | Randomized simulation with crash injection; Postgres concurrency tests | A request timeout below the lease in the adapter |
+| | Concurrent sends inside one worker (today: one at a time, scale by adding workers) |
 | | Reading `reply_to.mid` and button payloads when the platform provides them |
 | | Retention and partitioning of `run_log`, `messages`, `inbound_events` |
 | | Token refresh, account pause and customer notification on revoked access |

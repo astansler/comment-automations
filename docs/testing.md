@@ -1,12 +1,12 @@
 # Testing
 
-228 tests in four layers. Everything runs with `npm test`; the Postgres layers need `DATABASE_URL` and skip without it.
+239 tests in four layers. Everything runs with `npm test`; the Postgres layers need `DATABASE_URL` and skip without it.
 
 | Layer | Files | What it is for |
 |---|---|---|
-| Engine | `engine.test.ts`, `engine.properties.test.ts` | The pure `transition` function: 65 example tests and 6 properties, each over 500 random definitions and event sequences |
+| Engine | `engine.test.ts`, `engine.properties.test.ts` | The pure `transition` function: 69 example tests and 6 properties, each over 500 random definitions and event sequences |
 | Stores | `store.contract.ts` run by `store.memory.test.ts` and `store.pg.test.ts` | One suite of 40 tests that both stores must pass, plus Postgres tests with separate connections for locking and `SKIP LOCKED` |
-| Scenarios | `runtime.scenarios.ts` run on both stores | 32 named situations, each asserting the run's state and what the fake platform actually received |
+| Scenarios | `runtime.scenarios.ts` run on both stores | 35 named situations, each asserting the run's state and what the fake platform actually received |
 | Adversarial | `simulation.test.ts`, `concurrency.pg.test.ts` | Randomized whole-system simulation with crash injection; real concurrency on Postgres |
 
 The fake platform ([`test/support/fakePlatform.ts`](../test/support/fakePlatform.ts)) enforces the two Instagram rules the design depends on: a second private reply to the same comment is refused, and a DM to someone who has not written is refused. A test cannot pass by doing something the real platform would reject.
@@ -36,7 +36,7 @@ It is deterministic. A failure prints a seed and path, and `SIM_SEED=<seed> SIM_
 | I3 | The platform never refused a send for breaking its rules: no DM outside the window, and no private reply answered "already sent" unless that same message had been delivered. At most one private reply delivered per comment. |
 | I4 | Public replies and private replies are delivered at most once per message, under every fault. A later DM is delivered twice only if a fault touched that exact message: a failure after delivery, a crash while sending, or a lease that expired during the send. |
 | I5 | A run is waiting on a send if and only if the message it names is pending or being sent. Every pending message belongs to a run waiting on exactly it, or to a run that has ended. |
-| I6 | A consumed message was consumed by one run, of its own conversation, that had started by the time the message was received. A run examines at most `maxAttempts` messages per question. No run expires while a reply it could have used sits unconsumed. |
+| I6 | A consumed message was consumed by one run, of its own conversation, that had started by the time the message was received. A run examines at most `maxAttempts` messages per question. No run expires while a reply it could have used sits unconsumed: one written after its question was enqueued, or an earlier one that contains the email asked for. |
 | I7 | Within a run, deliveries happen in step order. No send is started for a run that has already ended. |
 | I8 | Every stored lead value came from a message that contact actually sent. |
 | I9 | A run that has ended never changes again. Checked after every commit. |

@@ -276,6 +276,54 @@ export function runtimeScenarios(name: string, makeStore: MakeStore): void {
       );
     });
 
+    it('does not count a message written before the question as a failed answer, and leaves it for the inbox', async () => {
+      const h = setup();
+      // The contact writes while the public reply is going out: the question does not exist yet.
+      h.platform.onDelivered(async (d) => {
+        if (d.kind !== 'reply_to_comment') return;
+        expect(await h.message('hi, is this still available?')).toMatchObject({ status: 'delivered', consumed: false });
+        h.clock.advance(1_000);
+      });
+      await h.publish();
+      await h.comment('pricing');
+      await h.runUntilIdle();
+
+      // No reprompt, no attempt used: the run simply waits for an answer to what it asked.
+      expect(await h.run('run-0001')).toMatchObject({ status: 'waiting_reply', attempt: 0 });
+      expect(h.sent()).toEqual([`reply_to_comment: ${TEXT.reply}`, `direct_message: ${TEXT.prompt}`]);
+      expect(await unconsumed(ALICE)).toHaveLength(1);
+
+      expect(await h.message('alice@example.com')).toMatchObject({ status: 'delivered', consumed: true });
+      await h.runUntilIdle();
+      expect(await h.run('run-0001')).toMatchObject({ status: 'completed', context: { email: 'alice@example.com' } });
+      expect(h.sent()).toEqual([
+        `reply_to_comment: ${TEXT.reply}`,
+        `direct_message: ${TEXT.prompt}`,
+        `direct_message: ${TEXT.link}`,
+      ]);
+      expect((await unconsumed(ALICE)).map((m) => m.text)).toEqual(['hi, is this still available?']);
+    });
+
+    it('uses an email the contact sent before the question was asked', async () => {
+      const h = setup();
+      h.platform.onDelivered(async (d) => {
+        if (d.kind !== 'reply_to_comment') return;
+        await h.message('send it to alice@example.com');
+        h.clock.advance(1_000);
+      });
+      await h.publish();
+      await h.comment('pricing');
+      await h.runUntilIdle();
+
+      expect(await h.run('run-0001')).toMatchObject({ status: 'completed', context: { email: 'alice@example.com' } });
+      expect(await unconsumed(ALICE)).toEqual([]);
+      expect(h.sent()).toEqual([
+        `reply_to_comment: ${TEXT.reply}`,
+        `direct_message: ${TEXT.prompt}`,
+        `direct_message: ${TEXT.link}`,
+      ]);
+    });
+
     it('reprompts on a reply without an email, without extending the deadline, then completes', async () => {
       const h = setup();
       const runId = await h.untilWaiting();
@@ -714,6 +762,32 @@ export function runtimeScenarios(name: string, makeStore: MakeStore): void {
       await h.runUntilIdle();
       expect(h.platform.reconcileCalls).toEqual([]);
       expect(h.platform.deliveries.filter((d) => d.key === 'run-0002:0:0')).toHaveLength(1);
+    });
+
+    it('keeps working through a batch when one write fails, reports the failure, and recovers the item by its policy', async () => {
+      const failing = createFaultyStore(store);
+      const h = setup();
+      const worker = createRuntime({ store: failing, adapter: h.platform, now: h.clock.now, newId: createIds('other') });
+      await h.publish();
+      await h.comment('pricing', { from: 'alice' });
+      await h.comment('pricing', { from: 'bob' });
+
+      // The worker's 3rd transaction (claim, read, settle) is the write recording alice's public reply.
+      failing.arm('before', 2);
+      await expect(worker.tick()).rejects.toBeInstanceOf(CrashError);
+
+      // Bob's reply, later in the same batch, was still sent and recorded.
+      expect(h.platform.sendCalls).toEqual(['run-0001:0:0', 'run-0002:0:0']);
+      expect(await h.effect('run-0002:0:0')).toMatchObject({ status: 'sent' });
+      // Alice's reached the platform but not the database: in doubt, like after a crash.
+      expect(await h.effect('run-0001:0:0')).toMatchObject({ status: 'sending' });
+
+      h.clock.advance(LEASE_MS);
+      await h.runUntilIdle();
+      expect(h.platform.reconcileCalls).toEqual(['run-0001:0:0']);
+      expect(h.platform.deliveries.filter((d) => d.key === 'run-0001:0:0')).toHaveLength(1);
+      expect(await h.run('run-0001')).toMatchObject({ status: 'waiting_reply' });
+      expect(await h.run('run-0002')).toMatchObject({ status: 'waiting_reply' });
     });
 
     it('cancelling a run drops its pending effect undelivered and promotes the next queued run', async () => {

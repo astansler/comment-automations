@@ -61,6 +61,10 @@ const fail = (run: Run, outcome: string, log: string[] = []): Change =>
 
 const dmKind = (run: Run): EffectKind => (run.windowOpen ? 'direct_message' : 'private_reply');
 
+/** The idempotency key of a step's send: attempt 0 is its first send, n its nth reprompt. */
+export const effectKey = (runId: string, stepIndex: number, attempt: number): string =>
+  `${runId}:${stepIndex}:${attempt}`;
+
 const emit = (
   run: Run,
   stepIndex: number,
@@ -68,7 +72,7 @@ const emit = (
   kind: EffectKind,
   text: string,
 ): { run: Run; effect: EffectRequest } => {
-  const key = `${run.id}:${stepIndex}:${attempt}`;
+  const key = effectKey(run.id, stepIndex, attempt);
   return {
     run: { ...run, status: 'awaiting_effect', stepIndex, attempt, pendingEffectKey: key },
     effect: { key, kind, text },
@@ -155,6 +159,12 @@ const apply = (steps: readonly Step[], run: Run, event: RunEvent, now: Millis): 
       if (step?.type !== 'ask') return fail(run, 'invalid_state');
       const opened: Run = { ...run, windowOpen: true };
       const value = capture(step.capture, event.text);
+      // Written before the question existed: an email sent unprompted is still
+      // the answer, but "hi" is not a failed attempt, and for a free-text
+      // question nothing written earlier can be the answer.
+      if (event.beforePrompt === true && (value === null || step.capture === 'any')) {
+        return run.windowOpen ? null : change(opened, ['conversation window opened']);
+      }
       if (value !== null) {
         const captured: Run = { ...opened, context: { ...opened.context, [step.saveAs]: value } };
         return {

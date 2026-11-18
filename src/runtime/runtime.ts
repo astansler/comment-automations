@@ -9,7 +9,7 @@
  * is resolved.
  */
 import { setTimeout as sleep } from 'node:timers/promises';
-import { matchesTrigger, newRun, transition, validateDefinition } from '../core/engine.js';
+import { effectKey, matchesTrigger, newRun, transition, validateDefinition } from '../core/engine.js';
 import {
   DELIVERY_POLICY,
   isTerminal,
@@ -90,6 +90,12 @@ export interface TickReport {
   timers: number;
 }
 
+/**
+ * Thrown by `tick` when more than one item of a pass failed. A single failure
+ * is rethrown as it is.
+ */
+export class TickError extends AggregateError {}
+
 export const isIdle = (report: TickReport): boolean =>
   report.timers === 0 && Object.values(report.effects).every((n) => n === 0);
 
@@ -98,7 +104,11 @@ export interface Runtime {
   ingestComment(comment: InboundComment): Promise<CommentResult>;
   ingestMessage(message: InboundMessageEvent): Promise<MessageResult>;
   cancelRun(runId: string, reason: string): Promise<CancelResult>;
-  /** One worker pass over due effects and due timers. */
+  /**
+   * One worker pass over due effects and due timers. A failure on one item (a
+   * lost connection, a run that cannot be loaded) does not stop the pass: the
+   * rest is still processed, and the failure is thrown once the pass is over.
+   */
   tick(): Promise<TickReport>;
 }
 
@@ -169,8 +179,12 @@ export function createRuntime(deps: {
   async function dispatch(tx: Tx, at: Millis, run: Run, event: RunEvent): Promise<TransitionResult> {
     const result = await apply(tx, at, run, event);
     if (result.run === run) return result;
-    if (result.run.status === 'waiting_reply') await drain(tx, at, result.run);
-    else if (isTerminal(result.run.status)) await promote(tx, at, run.accountId, run.contactId);
+    if (result.run.status === 'waiting_reply') {
+      // Stored messages older than this question (its first prompt, not a
+      // reprompt) were not written in reply to it.
+      const asked = await tx.getEffect(effectKey(result.run.id, result.run.stepIndex, 0));
+      await drain(tx, at, result.run, asked?.createdAt ?? result.run.startedAt ?? result.run.createdAt);
+    } else if (isTerminal(result.run.status)) await promote(tx, at, run.accountId, run.contactId);
     return result;
   }
 
@@ -179,16 +193,26 @@ export function createRuntime(deps: {
    * A reply that arrived while the prompt was still unacknowledged (fast user,
    * slow worker) is answered exactly as if it had arrived a moment later.
    *
-   * Terminates: the list is finite, and a waiting run consumes every message it
-   * is given and stops waiting (it captures, reprompts or fails), so the loop
-   * feeds at most one message before breaking.
+   * `askedAt` is when the question's first prompt was enqueued. A message older than that was
+   * written before the question existed ("hi" during the public reply). The
+   * engine uses it only if it plainly is the answer (an email); otherwise it
+   * stays unconsumed, for the human inbox, instead of costing the contact an
+   * attempt and an instant "that is not an email".
+   *
+   * Terminates: the list is finite. A message the run consumes also ends its
+   * waiting (it captures, reprompts or fails), so at most one is consumed.
    */
-  async function drain(tx: Tx, at: Millis, waiting: Run): Promise<void> {
+  async function drain(tx: Tx, at: Millis, waiting: Run, askedAt: Millis): Promise<void> {
     const since = waiting.startedAt ?? waiting.createdAt;
     let run = waiting;
     for (const message of await tx.listUnconsumedMessages(run.accountId, run.contactId, since)) {
       if (run.status !== 'waiting_reply') break;
-      const result = await apply(tx, at, run, { type: 'message_received', messageId: message.id, text: message.text });
+      const result = await apply(tx, at, run, {
+        type: 'message_received',
+        messageId: message.id,
+        text: message.text,
+        beforePrompt: message.receivedAt < askedAt,
+      });
       if (result.consumed) await tx.markMessageConsumed(message.id, run.id);
       run = result.run;
     }
@@ -474,29 +498,59 @@ export function createRuntime(deps: {
         timers: 0,
       };
 
-      const claims = await store.tx((tx) => tx.claimDueEffects(now(), config.batchSize, config.leaseMs));
+      // Each item is isolated: an effect whose write fails stays `sending` and is
+      // picked up by its delivery policy once the lease lapses, exactly as after
+      // a crash; a timer that fails is still due on the next pass.
+      const errors: unknown[] = [];
+      const attempt = async <T>(step: () => Promise<T>): Promise<T | undefined> => {
+        try {
+          return await step();
+        } catch (err) {
+          errors.push(err);
+          return undefined;
+        }
+      };
+
+      const claims = await attempt(() => store.tx((tx) => tx.claimDueEffects(now(), config.batchSize, config.leaseMs)));
       const throttled = new Set<string>();
       // Sequential, and with no transaction open across the network call.
-      for (const claim of claims) report.effects[await deliver(claim, throttled)]++;
-
-      const due = await store.tx((tx) => tx.listDueTimers(now(), config.batchSize));
-      for (const runId of due) {
-        // If a reply won the race the run is no longer waiting and the engine ignores the timer.
-        await withLockedRun(runId, (tx, run, at) => dispatch(tx, at, run, { type: 'timer_fired' }));
-        report.timers++;
+      for (const claim of claims ?? []) {
+        const outcome = await attempt(() => deliver(claim, throttled));
+        if (outcome !== undefined) report.effects[outcome]++;
       }
+
+      const due = await attempt(() => store.tx((tx) => tx.listDueTimers(now(), config.batchSize)));
+      for (const runId of due ?? []) {
+        // If a reply won the race the run is no longer waiting and the engine ignores the timer.
+        const fired = await attempt(async () => {
+          await withLockedRun(runId, (tx, run, at) => dispatch(tx, at, run, { type: 'timer_fired' }));
+          return true;
+        });
+        if (fired === true) report.timers++;
+      }
+
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) throw new TickError(errors, `${errors.length} items failed in one worker pass`);
       return report;
     },
   };
 }
 
-/** Calls `tick` until `signal` aborts, sleeping `intervalMs` only after a pass that found nothing to do. */
+/**
+ * Calls `tick` until `signal` aborts, sleeping `intervalMs` after a pass that
+ * found nothing to do or that failed. A failed pass never ends the loop: the
+ * error goes to `onError` and the next pass retries whatever is still due.
+ */
 export async function runWorker(
   runtime: Runtime,
-  { intervalMs, signal }: { intervalMs: Millis; signal: AbortSignal },
+  { intervalMs, signal, onError }: { intervalMs: Millis; signal: AbortSignal; onError?: (err: unknown) => void },
 ): Promise<void> {
   while (!signal.aborted) {
-    if (!isIdle(await runtime.tick())) continue;
+    try {
+      if (!isIdle(await runtime.tick())) continue;
+    } catch (err) {
+      onError?.(err);
+    }
     await sleep(intervalMs, undefined, { signal }).catch(() => {}); // an abort ends the sleep early
   }
 }

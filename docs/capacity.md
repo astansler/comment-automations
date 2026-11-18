@@ -21,9 +21,27 @@ Assumption: one in ten customers uses the feature, and an active account gets ab
 
 | Stage | Accounts using it | Runs / day | Row writes, avg | Row writes, peak | What the design needs |
 |---|---|---|---|---|---|
-| Today | 1,000 | 50,000 | 15 / s | 150 / s | Exactly what is in this repo. One Postgres, two worker dynos for redundancy. |
+| Today | 1,000 | 50,000 | 15 / s | 150 / s | Exactly what is in this repo. One Postgres. Worker count follows from sends, below. |
 | 10× | 10,000 | 500,000 | 150 / s | 1,500 / s | Same shape. Partition `run_log`, `messages` and `inbound_events` by month and drop old partitions. Move finished runs out of the hot table or rely on the partial indexes, which already exclude them. |
 | 100× | 100,000 | 5,000,000 | 1,500 / s | 15,000 / s | A single primary is now the constraint. Changes below. |
+
+### Sends, not writes, set the number of workers
+
+The table above counts database writes, which Postgres absorbs easily. The tighter limit is the outbox worker, which makes one platform call at a time.
+
+| | Sends |
+|---|---|
+| Per run | 3 |
+| Today, average | 150,000 a day, about 1.7 / s |
+| Today, peak | about 17 / s |
+| One worker | 1 / (latency of a platform call): about 3 / s at an assumed 300 ms |
+
+So two workers cover the average with room to spare, and the assumed peak needs about six. Until then the outbox simply runs behind for the length of the peak, which delays messages and loses none. Two ways to add throughput:
+
+- **More workers.** Needs nothing new: each due row goes to one claimer, and the concurrency tests run four workers at once.
+- **Concurrent sends inside a worker.** Cheaper per dyno. Sends for one conversation are already serialised by the run (one message in flight per run), so a batch can go out in parallel; what has to be kept is the lease check before each send and the per-account stop on a rate limit. Not built.
+
+The latency is my assumption; the number to watch in production is the age of the oldest due row in the outbox.
 
 Storage at today's stage: about 1.25 million rows a day, most of them log lines. At a few hundred bytes each that is well under a gigabyte a day before retention.
 
