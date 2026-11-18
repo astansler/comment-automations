@@ -304,6 +304,54 @@ export function runtimeScenarios(name: string, makeStore: MakeStore): void {
       expect((await unconsumed(ALICE)).map((m) => m.text)).toEqual(['hi, is this still available?']);
     });
 
+    it('does not count a message written while the question waited in the outbox, and does not reprompt right after asking', async () => {
+      const h = setup();
+      await h.publish();
+      await h.comment('pricing');
+      await h.tick(); // public reply sent; the question is enqueued, not delivered
+      h.clock.advance(60 * 60_000); // an hour behind a backlog
+      expect(await h.message('hello? anyone there?')).toMatchObject({ status: 'delivered', consumed: false });
+      h.clock.advance(1_000);
+      await h.runUntilIdle();
+
+      expect(await h.run('run-0001')).toMatchObject({ status: 'waiting_reply', attempt: 0 });
+      expect(h.sent()).toEqual([`reply_to_comment: ${TEXT.reply}`, `private_reply: ${TEXT.prompt}`]);
+      expect((await unconsumed(ALICE)).map((m) => m.text)).toEqual(['hello? anyone there?']);
+
+      expect(await h.message('alice@example.com')).toMatchObject({ status: 'delivered', consumed: true });
+      await h.runUntilIdle();
+      expect(await h.run('run-0001')).toMatchObject({ status: 'completed', context: { email: 'alice@example.com' } });
+    });
+
+    it('treats a late webhook for a message written before the question like the stored one: no attempt, no reprompt', async () => {
+      const h = setup();
+      await h.publish();
+      await h.comment('pricing');
+      h.clock.advance(2_000);
+      await h.runUntilIdle();
+      expect(await h.run('run-0001')).toMatchObject({ status: 'waiting_reply', attempt: 0 });
+
+      // Written half a second after the comment, delivered only now, while the run is waiting.
+      h.platform.contactMessaged(ACCOUNT, ALICE);
+      const late = { eventId: 'late-1', accountId: ACCOUNT, contactId: ALICE, at: T0 + 500 };
+      expect(await h.runtime.ingestMessage({ ...late, text: 'hi, is this still available?' })).toMatchObject({
+        status: 'delivered',
+        consumed: false,
+      });
+      await h.runUntilIdle();
+      expect(await h.run('run-0001')).toMatchObject({ status: 'waiting_reply', attempt: 0 });
+      expect(h.sent()).toEqual([`reply_to_comment: ${TEXT.reply}`, `private_reply: ${TEXT.prompt}`]);
+      expect(await unconsumed(ALICE)).toHaveLength(1);
+
+      // A late webhook that does carry the email is still the answer.
+      expect(await h.runtime.ingestMessage({ ...late, eventId: 'late-2', text: 'alice@example.com' })).toMatchObject({
+        status: 'delivered',
+        consumed: true,
+      });
+      await h.runUntilIdle();
+      expect(await h.run('run-0001')).toMatchObject({ status: 'completed', context: { email: 'alice@example.com' } });
+    });
+
     it('uses an email the contact sent before the question was asked', async () => {
       const h = setup();
       h.platform.onDelivered(async (d) => {

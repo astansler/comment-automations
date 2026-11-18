@@ -24,7 +24,7 @@ The brief asks for a design, not code. The code is here because "a reply racing 
 | [`docs/capacity.md`](docs/capacity.md) | Load estimates by stage, spikes, and what changes when |
 | [`docs/testing.md`](docs/testing.md) | The invariants checked, the two bugs the simulation found, and the mutation results |
 | [`src/`](src) | About 2,200 lines of TypeScript and SQL: the pure engine, the Postgres schema and store, the runtime |
-| [`test/`](test) | 245 tests: unit, property, scenario, randomized simulation, and real-Postgres concurrency |
+| [`test/`](test) | 249 tests: unit, property, scenario, randomized simulation, and real-Postgres concurrency |
 | [`AI-USAGE.md`](AI-USAGE.md) | What I did myself and where I used AI |
 
 ```bash
@@ -247,7 +247,7 @@ No transaction is open during a platform call. A crash can therefore only fall b
 
 **Waiting costs nothing.** A reply and a timeout are two events through the same locked transition: whichever commits first moves the run, and the other finds a run it no longer applies to and does nothing.
 
-**Correlating replies.** Every inbound DM is stored first, unconsumed. If the conversation has an active run that is waiting, it consumes the message. If the run is not waiting yet (the person answered faster than the platform acknowledged our question), the message stays unconsumed, and the moment the run enters `waiting_reply` it drains unconsumed messages received since it started. Arrival order stops mattering. One distinction is kept: a stored message written before the question was enqueued ("hi", sent while the public reply was going out) is used only if it plainly contains the answer, such as an email sent unprompted. Otherwise it is not a failed attempt; it stays unconsumed and the person is not told "that is not an email" about a question they had not seen. If no run owns the conversation, the message is left for the human inbox.
+**Correlating replies.** Every inbound DM is stored first, unconsumed. If the conversation has an active run that is waiting, it consumes the message. If the run is not waiting yet (the person answered faster than the platform acknowledged our question), the message stays unconsumed, and the moment the run enters `waiting_reply` it drains unconsumed messages received since it started. Arrival order stops mattering. One distinction is kept: a message written before the question was recorded as delivered ("hi" sent while the public reply was going out, or "anyone there?" while the question waited behind a rate limit) is used only if it plainly contains the answer, such as an email sent unprompted. The rule is the same whether the message was already stored or its webhook arrives late. Otherwise it is not a failed attempt; it stays unconsumed and the person is not told "that is not an email" about a question they had not seen. If no run owns the conversation, the message is left for the human inbox.
 
 **A second automation for the same person** is created `queued`. When the owner finishes, the next queued run is promoted in the same transaction. If it would ask for something we now know, `skipIfKnown` skips the question and its link goes out as that comment's private reply.
 

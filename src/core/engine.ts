@@ -159,7 +159,7 @@ const apply = (steps: readonly Step[], run: Run, event: RunEvent, now: Millis): 
       if (step?.type !== 'ask') return fail(run, 'invalid_state');
       const opened: Run = { ...run, windowOpen: true };
       const value = capture(step.capture, event.text);
-      // Written before the question existed: an email sent unprompted is still
+      // Written before the question was delivered: an email sent unprompted is still
       // the answer, but "hi" is not a failed attempt, and for a free-text
       // question nothing written earlier can be the answer.
       if (event.beforePrompt === true && (value === null || step.capture === 'any')) {

@@ -671,7 +671,7 @@ async function simulate(batchSize: number, actions: Action[]): Promise<void> {
     //     at or before the message's receivedAt; a run consumes at most maxAttempts messages
     //     per ask step; and no run expires while a reply it could have used sits unconsumed:
     //     a message of its conversation, stored before the expiry, received since the run
-    //     started, and either written after the question was enqueued or carrying the email
+    //     started, and either written after the question was recorded as delivered or carrying the email
     //     the question asks for (an earlier message that is not the answer is left alone).
     {
       const consumedBy = new Map<string, number>();
@@ -712,7 +712,9 @@ async function simulate(batchSize: number, actions: Action[]): Promise<void> {
         if (r.status !== 'expired' || terminalSeen.has(r.id)) continue;
         const automation = r.automationId.slice(r.accountId.length + 1) as keyof typeof DEFINITIONS;
         const step = DEFINITIONS[automation].steps[r.stepIndex];
-        const askedAt = effectsByKey.get(`${r.id}:${r.stepIndex}:0`)?.createdAt ?? Infinity;
+        // When the question was recorded as delivered: the settle time of its first prompt.
+        const prompt = effectsByKey.get(`${r.id}:${r.stepIndex}:0`);
+        const askedAt = prompt?.status === 'sent' ? prompt.updatedAt : Infinity;
         const lost = snap.messages.find(
           (m) =>
             storedBefore.has(m.id) &&

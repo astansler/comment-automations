@@ -179,13 +179,22 @@ export function createRuntime(deps: {
   async function dispatch(tx: Tx, at: Millis, run: Run, event: RunEvent): Promise<TransitionResult> {
     const result = await apply(tx, at, run, event);
     if (result.run === run) return result;
-    if (result.run.status === 'waiting_reply') {
-      // Stored messages older than this question (its first prompt, not a
-      // reprompt) were not written in reply to it.
-      const asked = await tx.getEffect(effectKey(result.run.id, result.run.stepIndex, 0));
-      await drain(tx, at, result.run, asked?.createdAt ?? result.run.startedAt ?? result.run.createdAt);
-    } else if (isTerminal(result.run.status)) await promote(tx, at, run.accountId, run.contactId);
+    if (result.run.status === 'waiting_reply') await drain(tx, at, result.run, await askedAt(tx, result.run));
+    else if (isTerminal(result.run.status)) await promote(tx, at, run.accountId, run.contactId);
     return result;
+  }
+
+  /**
+   * When the question a waiting run is on was recorded as delivered: the settle
+   * time of its first prompt (not of a reprompt), which never changes once set.
+   * A message the platform timestamps earlier than this was not written in
+   * reply to the question. Counting from delivery rather than from enqueueing
+   * matters during a backlog, when a prompt can sit in the outbox for hours
+   * while the contact keeps writing.
+   */
+  async function askedAt(tx: Tx, run: Run): Promise<Millis> {
+    const prompt = await tx.getEffect(effectKey(run.id, run.stepIndex, 0));
+    return prompt?.status === 'sent' ? prompt.updatedAt : (run.startedAt ?? run.createdAt);
   }
 
   /**
@@ -193,16 +202,17 @@ export function createRuntime(deps: {
    * A reply that arrived while the prompt was still unacknowledged (fast user,
    * slow worker) is answered exactly as if it had arrived a moment later.
    *
-   * `askedAt` is when the question's first prompt was enqueued. A message older than that was
-   * written before the question existed ("hi" during the public reply). The
-   * engine uses it only if it plainly is the answer (an email); otherwise it
-   * stays unconsumed, for the human inbox, instead of costing the contact an
-   * attempt and an instant "that is not an email".
+   * A message older than `askedAt` was written before the contact could have
+   * seen the question ("hi" during the public reply, "anyone there?" while the
+   * prompt waited behind a rate limit). The engine uses it only if it plainly
+   * is the answer (an email); otherwise it stays unconsumed, for the human
+   * inbox, instead of costing the contact an attempt and an instant "that is
+   * not an email". `ingestMessage` applies the same rule to a late webhook.
    *
    * Terminates: the list is finite. A message the run consumes also ends its
    * waiting (it captures, reprompts or fails), so at most one is consumed.
    */
-  async function drain(tx: Tx, at: Millis, waiting: Run, askedAt: Millis): Promise<void> {
+  async function drain(tx: Tx, at: Millis, waiting: Run, asked: Millis): Promise<void> {
     const since = waiting.startedAt ?? waiting.createdAt;
     let run = waiting;
     for (const message of await tx.listUnconsumedMessages(run.accountId, run.contactId, since)) {
@@ -211,7 +221,7 @@ export function createRuntime(deps: {
         type: 'message_received',
         messageId: message.id,
         text: message.text,
-        beforePrompt: message.receivedAt < askedAt,
+        beforePrompt: message.receivedAt < asked,
       });
       if (result.consumed) await tx.markMessageConsumed(message.id, run.id);
       run = result.run;
@@ -476,10 +486,14 @@ export function createRuntime(deps: {
         // A late webhook for a message sent before the run started is not an
         // answer to it: the same `startedAt` cut-off that drain applies.
         if (run === null || message.at < (run.startedAt ?? run.createdAt)) return { status: 'unmatched' };
+        // Nor is a late webhook for a message written before the question was
+        // delivered: the same `askedAt` cut-off that drain applies.
+        const beforePrompt = run.status === 'waiting_reply' && message.at < (await askedAt(tx, run));
         const result = await dispatch(tx, at, run, {
           type: 'message_received',
           messageId: message.eventId,
           text: message.text,
+          beforePrompt,
         });
         if (result.consumed) await tx.markMessageConsumed(message.eventId, run.id);
         return { status: 'delivered', runId: run.id, consumed: result.consumed };

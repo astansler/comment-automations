@@ -152,7 +152,7 @@ export type RunEvent =
   | { type: 'effect_failed'; key: string; code: string }
   /**
    * `beforePrompt`: the message was written before the current question was
-   * asked (it is being replayed from storage). It answers the question only if
+   * delivered (replayed from storage, or a late webhook). It answers the question only if
    * it plainly is the answer; otherwise the run leaves it alone.
    */
   | { type: 'message_received'; messageId: string; text: string; beforePrompt?: boolean }
